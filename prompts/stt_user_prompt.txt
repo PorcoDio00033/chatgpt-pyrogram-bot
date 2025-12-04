@@ -1,0 +1,1 @@
+AUDIO TRANSCRIPTION:\n{transcript}\n\n{{{{ User }}}} PROMPT:\n{transcribe_user_prompt}

@@ -1,4 +1,3 @@
-import logging
 import subprocess
 import sys
 import time
@@ -7,8 +6,10 @@ from pathlib import Path
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
+from bot.chill_logging import get_logger_instance, DEBUG
+
 # Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+logger = get_logger_instance("dev", in_subfolder=False, level=DEBUG).logger
 
 
 class BotReloader(FileSystemEventHandler):
@@ -23,14 +24,14 @@ class BotReloader(FileSystemEventHandler):
         if self.process:
             self.stop_bot()
 
-        logging.info('Starting bot...')
+        logger.info('Starting bot...')
         self.process = subprocess.Popen([sys.executable, 'bot/main.py'])
         self.last_restart = time.time()
 
     def stop_bot(self):
         """Stop the bot process"""
         if self.process:
-            logging.info('Stopping bot...')
+            logger.info('Stopping bot...')
             self.process.terminate()
             self.process.wait()
             self.process = None
@@ -41,7 +42,7 @@ class BotReloader(FileSystemEventHandler):
         if current_time - self.last_restart < self.restart_delay:
             return
 
-        logging.info('Restarting bot...')
+        logger.info('Restarting bot...')
         self.start_bot()
 
     def on_modified(self, event):
@@ -50,7 +51,7 @@ class BotReloader(FileSystemEventHandler):
 
         # Only restart on Python file changes
         if Path(event.src_path).suffix == '.py':
-            logging.info(f'Detected change in {event.src_path}')
+            logger.info(f'Detected change in {event.src_path}')
             self.restart_bot()
 
     def __del__(self):
@@ -70,7 +71,7 @@ def main():
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
-        logging.info('Stopping development server...')
+        logger.info('Stopping development server...')
         observer.stop()
         reloader.stop_bot()
 

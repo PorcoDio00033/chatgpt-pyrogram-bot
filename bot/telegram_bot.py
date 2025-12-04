@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import io
-import logging
 import os
 import tempfile
 import time
@@ -10,42 +10,41 @@ from collections.abc import Sequence
 from datetime import datetime
 from typing import Dict, Optional
 from uuid import uuid4
-from venv import logger
-
 import asyncpg
-from decorators import with_conversation_lock
-from openai_helper import OpenAIHelper, localized_text
 from PIL import Image
 from pydub import AudioSegment
 from pypdf import PdfReader
-from telegram import (
+# used for tgs to mp4 converter
+from lottie.parsers.tgs import parse_tgs
+from lottie.exporters.video import export_video
+
+from pyrogram import Client, filters, enums, types
+from pyrogram.errors import BadRequest, MessageNotModified, FloodWait
+from pyrogram.handlers import (
+    MessageHandler,
+    CallbackQueryHandler,
+    InlineQueryHandler,
+    ChosenInlineResultHandler,
+    MessageReactionUpdatedHandler
+)
+from pyrogram.types import (
     BotCommand,
     BotCommandScopeAllGroupChats,
-    Document,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InlineQueryResultArticle,
-    InputMediaDocument,
-    InputMediaPhoto,
     InputTextMessageContent,
+    InputMediaPhoto,
+    InputMediaDocument,
     Message,
-    ReactionTypeEmoji,
-    Update,
-    constants,
+    CallbackQuery,
+    InlineQuery,
+    ChosenInlineResult
 )
-from telegram.error import BadRequest, RetryAfter, TimedOut
-from telegram.ext import (
-    Application,
-    ApplicationBuilder,
-    CallbackQueryHandler,
-    ChosenInlineResultHandler,
-    CommandHandler,
-    ContextTypes,
-    InlineQueryHandler,
-    MessageHandler,
-    MessageReactionHandler,
-    filters,
-)
+
+from chill_logging import get_logger_instance
+from decorators import with_conversation_lock
+from openai_helper import OpenAIHelper, localized_text
 from usage_tracker import UsageTracker
 from utils import (
     add_chat_request_to_usage_tracker,
@@ -54,7 +53,7 @@ from utils import (
     error_handler,
     get_forum_thread_id,
     get_remaining_budget,
-    get_reply_to_message_id,
+    is_quoting_enabled,
     get_stream_cutoff_values,
     handle_direct_result,
     has_image_gen_permission,
@@ -66,6 +65,7 @@ from utils import (
     message_text,
     split_into_chunks,
     wrap_with_indicator,
+    extract_username
 )
 
 
@@ -204,6 +204,7 @@ class ChatGPTTelegramBot:
         """
         self.config = config
         self.openai = openai
+        self.logger = get_logger_instance("telegram_bot").logger
         self.rate_limiter = RateLimiter(config)
         bot_language = self.config['bot_language']
         self.commands = [
@@ -259,13 +260,22 @@ class ChatGPTTelegramBot:
         self.bot_message_ids = set()
         self.pending_quality_confirmations = {}  # Store pending confirmations
 
-    def get_thread_id(self, update: Update) -> str:
-        c = update.effective_chat.id
-        m = update.effective_message
+        # Initialize Pyrogram Client
+        self.client = Client(
+            "chatgpt_pyrogram_bot",
+            api_id=self.config['telegram_api_id'],
+            api_hash=self.config['telegram_api_hash'],
+            bot_token=self.config['token'],
+            proxy=self.config['proxy']
+        )
+
+    def get_thread_id(self, message: Message) -> str:
+        c = message.chat.id
+        m = message
         if not m:
             raise ValueError('No message found in update')
 
-        if is_private_chat(update):
+        if is_private_chat(message):
             return f'{c}'
 
         if not m.reply_to_message:
@@ -280,8 +290,8 @@ class ChatGPTTelegramBot:
         thread_id = self.replies_tracker[m.id]
         return f'{c}_{thread_id}'
 
-    def get_real_thread_id(self, update: Update) -> Optional[int]:
-        m = update.effective_message
+    def get_real_thread_id(self, message: Message) -> Optional[int]:
+        m = message
         if not m:
             raise ValueError('No message found in update')
 
@@ -296,19 +306,21 @@ class ChatGPTTelegramBot:
 
         return self.replies_tracker[m.id]
 
-    def save_reply(self, msg: Message, update: Update):
-        self.bot_message_ids.add((msg.chat.id, msg.message_id))
+    def save_reply(self, msg: Message, original_message: Message):
+        if not msg:
+            return
+        self.bot_message_ids.add((msg.chat.id, msg.id))
 
-        if is_private_chat(update):
+        if is_private_chat(original_message):
             return
 
-        self.replies_tracker[msg.message_id] = self.get_real_thread_id(update)
+        self.replies_tracker[msg.id] = self.get_real_thread_id(original_message)
 
-    async def help(self, update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    async def help(self, client: Client, message: Message) -> None:
         """
         Shows the help menu.
         """
-        commands = self.group_commands if is_group_chat(update) else self.commands
+        commands = self.group_commands if is_group_chat(message) else self.commands
         commands_description = [f'/{command.command} - {command.description}' for command in commands]
         bot_language = self.config['bot_language']
         help_text = (
@@ -320,27 +332,27 @@ class ChatGPTTelegramBot:
             + '\n\n'
             + localized_text('help_text', bot_language)[2]
         )
-        await update.message.reply_text(help_text, disable_web_page_preview=True)
+        await message.reply_text(help_text, link_preview_options=types.LinkPreviewOptions(is_disabled=True))
 
-    async def stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def stats(self, client: Client, message: Message):
         """
         Returns token usage statistics for current day and month.
         """
-        if not await is_allowed(self.config, update, context):
-            logging.warning(
-                f'User {update.message.from_user.name} (id: {update.message.from_user.id}) '
+        if not await is_allowed(self.config, client, message):
+            self.logger.warning(
+                f'User {extract_username(message.from_user)} (id: {message.from_user.id}) '
                 'is not allowed to request their usage statistics'
             )
-            await self.send_disallowed_message(update, context)
+            await self.send_disallowed_message(client, message)
             return
 
-        logging.info(
-            f'User {update.message.from_user.name} (id: {update.message.from_user.id}) requested their usage statistics'
+        self.logger.info(
+            f'User {extract_username(message.from_user)} (id: {message.from_user.id}) requested their usage statistics'
         )
 
-        user_id = update.message.from_user.id
+        user_id = message.from_user.id
         if user_id not in self.usage:
-            self.usage[user_id] = UsageTracker(user_id, update.message.from_user.name)
+            self.usage[user_id] = UsageTracker(user_id, extract_username(message.from_user))
 
         tokens_today, tokens_month = self.usage[user_id].get_current_token_usage()
         images_today, images_month = self.usage[user_id].get_current_image_count()
@@ -354,9 +366,9 @@ class ChatGPTTelegramBot:
         characters_today, characters_month = self.usage[user_id].get_current_tts_usage()
         current_cost = self.usage[user_id].get_current_cost()
 
-        chat_id = update.effective_chat.id
+        chat_id = message.chat.id
         chat_messages, chat_token_length = await self.openai.get_conversation_stats(chat_id)
-        remaining_budget = get_remaining_budget(self.config, self.usage, update)
+        remaining_budget = get_remaining_budget(self.config, self.usage, message)
         bot_language = self.config['bot_language']
 
         text_current_conversation = (
@@ -433,63 +445,65 @@ class ChatGPTTelegramBot:
         #     )
 
         usage_text = text_current_conversation + text_today + text_month + text_budget
-        await update.message.reply_text(usage_text, parse_mode=constants.ParseMode.HTML)
+        await message.reply_text(usage_text, parse_mode=enums.ParseMode.HTML)
 
-    async def resend(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def resend(self, client: Client, message: Message):
         """
         Resend the last request
         """
-        if not await is_allowed(self.config, update, context):
-            logging.warning(
-                f'User {update.message.from_user.name}  (id: {update.message.from_user.id})'
+        if not await is_allowed(self.config, client, message):
+            self.logger.warning(
+                f'User {extract_username(message.from_user)}  (id: {message.from_user.id})'
                 ' is not allowed to resend the message'
             )
-            await self.send_disallowed_message(update, context)
+            await self.send_disallowed_message(client, message)
             return
 
-        chat_id = update.effective_chat.id
+        chat_id = message.chat.id
         if chat_id not in self.last_message:
-            logging.warning(
-                f'User {update.message.from_user.name} (id: {update.message.from_user.id})'
+            self.logger.warning(
+                f'User {extract_username(message.from_user)} (id: {message.from_user.id})'
                 ' does not have anything to resend'
             )
-            await update.effective_message.reply_text(
-                message_thread_id=get_forum_thread_id(update),
+            await message.reply_text(
                 text=localized_text('resend_failed', self.config['bot_language']),
+                #message_thread_id=get_forum_thread_id(message)
             )
             return
 
         # Update message text, clear self.last_message and send the request to prompt
-        logging.info(
-            f'Resending the last prompt from user: {update.message.from_user.name} (id: {update.message.from_user.id})'
+        self.logger.info(
+            f'Resending the last prompt from user: {extract_username(message.from_user)} (id: {message.from_user.id})'
         )
-        with update.message._unfrozen() as message:
-            message.text = self.last_message.pop(chat_id)
+        
+        # Pyrogram can't modify the message object in place like PTB's _unfrozen()
+        # Pyrogram objects are mutable.
+        message.text = self.last_message.pop(chat_id)
 
-        await self.prompt(update=update, context=context)
+        await self.prompt(client, message)
 
-    async def reset(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def reset(self, client: Client, message: Message):
         """
         Resets the conversation.
         """
-        if not await is_allowed(self.config, update, context):
-            logging.warning(
-                f'User {update.message.from_user.name} (id: {update.message.from_user.id}) '
+        if not await is_allowed(self.config, client, message):
+            self.logger.warning(
+                f'User {extract_username(message.from_user)} (id: {message.from_user.id}) '
                 'is not allowed to reset the conversation'
             )
-            await self.send_disallowed_message(update, context)
+            await self.send_disallowed_message(client, message)
             return
 
-        ai_context_id = self.get_thread_id(update)
-        logging.info(f'Resetting the conversation for {ai_context_id}.')
+        ai_context_id = self.get_thread_id(message)
+        self.logger.info(f'Resetting the conversation for {ai_context_id}.')
 
-        reset_content = message_text(update.message)
+        reset_content = message_text(message)
         await self.openai.reset_chat_history(chat_id=ai_context_id, content=reset_content)
-        sent_msg = await update.effective_message.reply_text(
-            message_thread_id=get_forum_thread_id(update),
+        sent_msg = await message.reply_text(
             text=localized_text('reset_done', self.config['bot_language']),
+            #message_thread_id=get_forum_thread_id(message)
         )
-        self.save_reply(sent_msg, update)
+        self.save_reply(sent_msg, message)
 
     def _get_quality_reply_markup(self, prompt_id):
         if prompt_id not in self.image_quality_cache or 'highest' not in self.image_quality_cache[prompt_id]:
@@ -531,8 +545,7 @@ class ChatGPTTelegramBot:
         ]
         return InlineKeyboardMarkup(keyboard)
 
-    async def handle_show_quality(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
+    async def handle_show_quality(self, client: Client, query: CallbackQuery):
         await query.answer()
 
         if not has_image_gen_permission(self.config, query.from_user.id):
@@ -551,22 +564,21 @@ class ChatGPTTelegramBot:
         reply_markup = self._get_quality_reply_markup(prompt_id)
 
         if self.config['image_receive_mode'] == 'photo':
-            await context.bot.edit_message_media(
-                chat_id=query.message.chat_id,
-                message_id=query.message.message_id,
+            await client.edit_message_media(
+                chat_id=query.message.chat.id,
+                message_id=query.message.id,
                 media=InputMediaPhoto(media=file_id, caption=caption),
                 reply_markup=reply_markup,
             )
         elif self.config['image_receive_mode'] == 'document':
-            await context.bot.edit_message_media(
-                chat_id=query.message.chat_id,
-                message_id=query.message.message_id,
+            await client.edit_message_media(
+                chat_id=query.message.chat.id,
+                message_id=query.message.id,
                 media=InputMediaDocument(media=file_id, caption=caption),
                 reply_markup=reply_markup,
             )
 
-    async def handle_quality_confirmation(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
+    async def handle_quality_confirmation(self, client: Client, query: CallbackQuery):
         await query.answer()
 
         if not has_image_gen_permission(self.config, query.from_user.id):
@@ -594,15 +606,14 @@ class ChatGPTTelegramBot:
         }
 
         # Update the message with confirmation dialog
-        await context.bot.edit_message_caption(
-            chat_id=query.message.chat_id,
-            message_id=query.message.message_id,
+        await client.edit_message_caption(
+            chat_id=query.message.chat.id,
+            message_id=query.message.id,
             caption=confirmation_text,
             reply_markup=self._get_confirmation_markup(prompt_id),
         )
 
-    async def handle_quality_cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
+    async def handle_quality_cancel(self, client: Client, query: CallbackQuery):
         await query.answer()
 
         parts = query.data.split(':')
@@ -614,70 +625,73 @@ class ChatGPTTelegramBot:
 
         # Restore original markup
         original_caption = self.image_quality_cache[prompt_id]['medium']['caption']
-        await context.bot.edit_message_caption(
-            chat_id=query.message.chat_id,
-            message_id=query.message.message_id,
+        await client.edit_message_caption(
+            chat_id=query.message.chat.id,
+            message_id=query.message.id,
             caption=original_caption,
             reply_markup=self._get_quality_reply_markup(prompt_id),
         )
 
-    async def image(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def image(self, client: Client, message: Message):
         """
         Generates an image for the given prompt using DALL·E or GPT Image APIs
         """
         if not self.config['enable_image_generation'] or not await self.check_allowed_and_within_budget(
-            update, context
+            client, message
         ):
             return
 
         bot_language = self.config['bot_language']
 
-        if not has_image_gen_permission(self.config, update.message.from_user.id):
-            logger.warning(
-                f'User {update.message.from_user.name} (id: {update.message.from_user.id}) '
+        if not has_image_gen_permission(self.config, message.from_user.id):
+            self.logger.warning(
+                f'User {extract_username(message.from_user)} (id: {message.from_user.id}) '
                 'is not allowed to generate images'
             )
             return
 
-        image_query = message_text(update.message)
+        image_query = message_text(message)
 
         if not image_query:
-            await update.effective_message.reply_text(
-                message_thread_id=get_forum_thread_id(update),
+            await message.reply_text(
                 text=localized_text('image_no_prompt', self.config['bot_language']),
+                #message_thread_id=get_forum_thread_id(message)
             )
             return
 
-        reply = update.message.reply_to_message
-        effective_attachment = reply.effective_attachment if reply else None
-        image_to_edit_attachment = image_to_edit = None
-        if isinstance(effective_attachment, Sequence):
-            image_to_edit_attachment = effective_attachment[-1]
+        reply = message.reply_to_message
+        image_to_edit_attachment = None
+        image_to_edit = None
+        
+        if reply:
+            if reply.photo:
+                image_to_edit_attachment = reply.photo
+            elif reply.document and reply.document.mime_type.startswith('image/'):
+                image_to_edit_attachment = reply.document
 
         try:
             if image_to_edit_attachment:
-                media_file = await context.bot.get_file(image_to_edit_attachment.file_id)
-                image_to_edit = io.BytesIO()
-                await media_file.download_to_memory(out=image_to_edit)
+                image_to_edit = await client.download_media(image_to_edit_attachment, in_memory=True)
+                # image_to_edit is BytesIO object
                 image_to_edit.seek(0)
         except Exception as e:
-            logging.exception(e)
-            await update.effective_message.reply_text(
-                message_thread_id=get_forum_thread_id(update),
-                reply_to_message_id=get_reply_to_message_id(self.config, update),
+            self.logger.exception(e)
+            await message.reply_text(
                 text=(
                     f'{localized_text("media_download_fail", bot_language)[0]}: '
                     f'{str(e)}. {localized_text("media_download_fail", bot_language)[1]}'
                 ),
-                parse_mode=constants.ParseMode.HTML,
+                parse_mode=enums.ParseMode.HTML,
+                reply_parameters=is_quoting_enabled(self.config, message),
+                #message_thread_id=get_forum_thread_id(message)
             )
             return
 
-        user_id = update.message.from_user.id
+        user_id = message.from_user.id
 
         action_msg = 'EDITING' if image_to_edit else 'GENERATING'
-        logging.info(
-            f'New image {action_msg} request received from user {update.message.from_user.name} (id: {user_id})'
+        self.logger.info(
+            f'New image {action_msg} request received from user {extract_username(message.from_user)} (id: {user_id})'
         )
 
         async def _generate():
@@ -699,54 +713,54 @@ class ChatGPTTelegramBot:
                     self.image_to_edit_cache[prompt_id] = image_copy
 
                 # Add username to price caption
-                username = update.message.from_user.username or update.message.from_user.first_name
-                price_with_user = f'{price}\n\nby @{username}'
+                price_with_user = f'{price}\n\nby {extract_username(message.from_user)}'
 
                 reply_markup = self._get_quality_reply_markup(prompt_id)
                 if self.config['image_receive_mode'] == 'photo':
-                    sent_msg = await update.effective_message.reply_photo(
-                        reply_to_message_id=get_reply_to_message_id(self.config, update),
+                    sent_msg = await message.reply_photo(
                         photo=image_bytes,
                         caption=price_with_user,
                         reply_markup=reply_markup,
+                        reply_parameters=is_quoting_enabled(self.config, message),
+                        #message_thread_id=get_forum_thread_id(message)
                     )
-                    file_id = sent_msg.photo[-1].file_id
+                    file_id = sent_msg.photo.file_id
                 elif self.config['image_receive_mode'] == 'document':
-                    sent_msg = await update.effective_message.reply_document(
-                        reply_to_message_id=get_reply_to_message_id(self.config, update),
+                    sent_msg = await message.reply_document(
                         document=image_bytes,
                         caption=price_with_user,
                         reply_markup=reply_markup,
+                        reply_parameters=is_quoting_enabled(self.config, message),
+                        #message_thread_id=get_forum_thread_id(message)
                     )
                     file_id = sent_msg.document.file_id
                 else:
                     raise Exception(
-                        f'env variable IMAGE_RECEIVE_MODE has invalid value {self.config["image_receive_mode"]}'
+                        f'env variable IMAGE_FORMAT has invalid value {self.config["image_receive_mode"]}'
                     )
 
                 self.image_quality_cache[prompt_id]['low'] = {'file_id': file_id, 'caption': price_with_user}
 
-                user_id = update.message.from_user.id
+                user_id = message.from_user.id
                 if user_id not in self.usage:
-                    self.usage[user_id] = UsageTracker(user_id, update.message.from_user.name)
+                    self.usage[user_id] = UsageTracker(user_id, extract_username(message.from_user))
 
                 self.usage[user_id].add_image_request(image_size, self.config['image_prices'])
                 if str(user_id) not in self.config['allowed_user_ids'].split(',') and 'guests' in self.usage:
                     self.usage['guests'].add_image_request(image_size, self.config['image_prices'])
 
             except Exception as e:
-                logging.exception(e)
-                await update.effective_message.reply_text(
-                    message_thread_id=get_forum_thread_id(update),
-                    reply_to_message_id=get_reply_to_message_id(self.config, update),
+                self.logger.exception(e)
+                await message.reply_text(
                     text=f'{localized_text("image_fail", self.config["bot_language"])}: {str(e)}',
-                    parse_mode=constants.ParseMode.HTML,
+                    parse_mode=enums.ParseMode.HTML,
+                    reply_parameters=is_quoting_enabled(self.config, message),
+                    #message_thread_id=get_forum_thread_id(message)
                 )
 
-        await wrap_with_indicator(update, context, _generate, constants.ChatAction.UPLOAD_PHOTO)
+        await wrap_with_indicator(client, message, _generate, enums.ChatAction.UPLOAD_PHOTO)
 
-    async def handle_improve_quality(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
+    async def handle_improve_quality(self, client: Client, query: CallbackQuery):
         await query.answer()
 
         if not has_image_gen_permission(self.config, query.from_user.id):
@@ -759,7 +773,7 @@ class ChatGPTTelegramBot:
         # Check if this is a confirmed action for high quality
         if target_quality == 'high' and prompt_id not in self.pending_quality_confirmations:
             # If not confirmed, show confirmation dialog
-            await self.handle_quality_confirmation(update, context)
+            await self.handle_quality_confirmation(client, query)
             return
 
         # Clean up confirmation state if it exists
@@ -780,8 +794,8 @@ class ChatGPTTelegramBot:
 
         loading_keyboard = [[InlineKeyboardButton('⏳ Generating...', callback_data='loading')]]
         loading_markup = InlineKeyboardMarkup(loading_keyboard)
-        await context.bot.edit_message_reply_markup(
-            chat_id=query.message.chat_id, message_id=query.message.message_id, reply_markup=loading_markup
+        await client.edit_message_reply_markup(
+            chat_id=query.message.chat.id, message_id=query.message.id, reply_markup=loading_markup
         )
 
         async def _generate():
@@ -801,17 +815,17 @@ class ChatGPTTelegramBot:
 
                 reply_markup = self._get_quality_reply_markup(prompt_id)
                 if self.config['image_receive_mode'] == 'photo':
-                    sent_msg = await context.bot.edit_message_media(
-                        chat_id=query.message.chat_id,
-                        message_id=query.message.message_id,
+                    sent_msg = await client.edit_message_media(
+                        chat_id=query.message.chat.id,
+                        message_id=query.message.id,
                         media=InputMediaPhoto(image_bytes, caption=price_with_user),
                         reply_markup=reply_markup,
                     )
-                    file_id = sent_msg.photo[-1].file_id
+                    file_id = sent_msg.photo.file_id
                 else:
-                    sent_msg = await context.bot.edit_message_media(
-                        chat_id=query.message.chat_id,
-                        message_id=query.message.message_id,
+                    sent_msg = await client.edit_message_media(
+                        chat_id=query.message.chat.id,
+                        message_id=query.message.id,
                         media=InputMediaDocument(image_bytes, caption=price_with_user),
                         reply_markup=reply_markup,
                     )
@@ -821,58 +835,59 @@ class ChatGPTTelegramBot:
 
                 user_id = query.from_user.id
                 if user_id not in self.usage:
-                    self.usage[user_id] = UsageTracker(user_id, query.from_user.name)
+                    self.usage[user_id] = UsageTracker(user_id, extract_username(query.from_user))
 
                 self.usage[user_id].add_image_request(image_size, self.config['image_prices'])
                 if str(user_id) not in self.config['allowed_user_ids'].split(',') and 'guests' in self.usage:
                     self.usage['guests'].add_image_request(image_size, self.config['image_prices'])
 
             except Exception as e:
-                logging.exception(e)
-                await context.bot.send_message(
-                    chat_id=query.message.chat_id,
+                self.logger.exception(e)
+                await client.send_message(
+                    chat_id=query.message.chat.id,
                     text=f'Failed to improve image quality: {str(e)}',
-                    reply_to_message_id=query.message.message_id,
+                    reply_parameters=types.ReplyParameters(query.message.id),
                 )
 
-        await wrap_with_indicator(update, context, _generate, constants.ChatAction.UPLOAD_PHOTO)
+        await wrap_with_indicator(client, query.message, _generate, enums.ChatAction.UPLOAD_PHOTO)
 
-    async def tts(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def tts(self, client: Client, message: Message):
         """
         Generates an speech for the given input using TTS APIs
         """
-        if not self.config['enable_tts_generation'] or not await self.check_allowed_and_within_budget(update, context):
+        if not self.config['enable_tts_generation'] or not await self.check_allowed_and_within_budget(client, message):
             return
 
-        tts_query = message_text(update.message)
-        if update.message.reply_to_message and update.message.reply_to_message.text:
-            reply_text = message_text(update.message.reply_to_message)
+        tts_query = message_text(message)
+        if message.reply_to_message and message.reply_to_message.text:
+            reply_text = message_text(message.reply_to_message)
             tts_query = f'{reply_text} {tts_query}'.strip()
 
         if not tts_query:
-            await update.effective_message.reply_text(
-                message_thread_id=get_forum_thread_id(update),
+            await message.reply_text(
                 text=localized_text('tts_no_prompt', self.config['bot_language']),
+                #message_thread_id=get_forum_thread_id(message)
             )
             return
 
-        logging.info(
-            f'New speech generation request received from user {update.message.from_user.name} '
-            f'(id: {update.message.from_user.id})'
+        self.logger.info(
+            f'New speech generation request received from user {extract_username(message.from_user)} '
+            f'(id: {message.from_user.id})'
         )
 
         async def _generate():
             try:
                 speech_file, text_length = await self.openai.generate_speech(text=tts_query)
 
-                sent_msg = await update.effective_message.reply_voice(
-                    reply_to_message_id=get_reply_to_message_id(self.config, update),
+                sent_msg = await message.reply_voice(
                     voice=speech_file,
+                    reply_parameters=is_quoting_enabled(self.config, message),
+                    #message_thread_id=get_forum_thread_id(message)
                 )
-                self.save_reply(sent_msg, update)
+                self.save_reply(sent_msg, message)
                 speech_file.close()
                 # add image request to users usage tracker
-                user_id = update.message.from_user.id
+                user_id = message.from_user.id
                 self.usage[user_id].add_tts_request(text_length, self.config['tts_model'], self.config['tts_prices'])
                 # add guest chat request to guest usage tracker
                 if str(user_id) not in self.config['allowed_user_ids'].split(',') and 'guests' in self.usage:
@@ -881,76 +896,91 @@ class ChatGPTTelegramBot:
                     )
 
             except Exception as e:
-                logging.exception(e)
-                await update.effective_message.reply_text(
-                    message_thread_id=get_forum_thread_id(update),
-                    reply_to_message_id=get_reply_to_message_id(self.config, update),
+                self.logger.exception(e)
+                await message.reply_text(
                     text=f'{localized_text("tts_fail", self.config["bot_language"])}: {str(e)}',
-                    parse_mode=constants.ParseMode.HTML,
+                    parse_mode=enums.ParseMode.HTML,
+                    reply_parameters=is_quoting_enabled(self.config, message),
+                    #message_thread_id=get_forum_thread_id(message)
                 )
 
-        await wrap_with_indicator(update, context, _generate, constants.ChatAction.UPLOAD_VOICE)
+        await wrap_with_indicator(client, message, _generate, enums.ChatAction.UPLOAD_AUDIO)
 
-    async def transcribe(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def transcribe(self, client: Client, message: Message):
         """
         Transcribe audio messages.
         """
-        if not self.config['enable_transcription'] or not await self.check_allowed_and_within_budget(update, context):
+        if not self.config['enable_transcription'] or not await self.check_allowed_and_within_budget(client, message):
             return
 
-        if is_group_chat(update) and self.config['ignore_group_transcriptions']:
-            logging.info('Transcription coming from group chat, ignoring...')
+        if is_group_chat(message) and self.config['ignore_group_transcriptions']:
+            self.logger.info('Transcription coming from group chat, ignoring...')
             return
+        
+        if message.command:
+            transcribe_user_prompt = ' '.join(message.command[1:]) # extract text after /stt
+        else:
+            transcribe_user_prompt = message.text
+        
+        if message.reply_to_message:
+            target_message = message.reply_to_message
+        else:
+            target_message = message
 
-        ai_context_id = self.get_thread_id(update)
-        filename = update.message.effective_attachment.file_unique_id
+        ai_context_id = self.get_thread_id(message)
+        
+        # Pyrogram doesn't have file_unique_id directly on message, it's on the media object
+        media = target_message.voice or target_message.audio or target_message.video or target_message.video_note or target_message.document
+        if not media:
+            return
+            
+        filename = media.file_unique_id
 
+        # TODO: add env "ALWAYS_TRANSCODE_TO_MP3" to be able to upload original files as provided by users instead of always transcoding them
         async def _execute():
             filename_mp3 = f'{filename}.mp3'
             bot_language = self.config['bot_language']
+            
+            downloaded_path = None
             try:
-                media_file = await context.bot.get_file(update.message.effective_attachment.file_id)
-                await media_file.download_to_drive(filename)
+                downloaded_path = await client.download_media(target_message, file_name=filename)
             except Exception as e:
-                logging.exception(e)
-                sent_msg = await update.effective_message.reply_text(
-                    message_thread_id=get_forum_thread_id(update),
-                    reply_to_message_id=get_reply_to_message_id(self.config, update),
+                self.logger.exception(e)
+                sent_msg = await message.reply_text(
                     text=(
                         f'{localized_text("media_download_fail", bot_language)[0]}: '
                         f'{str(e)}. {localized_text("media_download_fail", bot_language)[1]}'
                     ),
-                    parse_mode=constants.ParseMode.HTML,
+                    parse_mode=enums.ParseMode.HTML,
+                    reply_parameters=is_quoting_enabled(self.config, message),
+                    #message_thread_id=get_forum_thread_id(message)
                 )
-                self.save_reply(sent_msg, update)
+                self.save_reply(sent_msg, message)
                 return
 
             try:
-                audio_track = AudioSegment.from_file(filename)
+                audio_track = AudioSegment.from_file(downloaded_path)
                 # FIXME do not save to file
                 audio_track.export(filename_mp3, format='mp3')
-                logging.info(
-                    f'New transcribe request received from user {update.message.from_user.name} '
-                    f'(id: {update.message.from_user.id})'
+                self.logger.info(
+                    f'New transcribe request received from user {extract_username(message.from_user)} '
+                    f'(id: {message.from_user.id})'
                 )
 
             except Exception as e:
-                logging.exception(e)
-                # await update.effective_message.reply_text(
-                #     message_thread_id=get_forum_thread_id(update),
-                #     reply_to_message_id=get_reply_to_message_id(self.config, update),
-                #     text=localized_text('media_type_fail', bot_language),
-                # )
+                self.logger.exception(e)
                 if os.path.exists(filename):
                     os.remove(filename)
+                if downloaded_path and os.path.exists(downloaded_path):
+                    os.remove(downloaded_path)
                 return
 
-            user_id = update.message.from_user.id
+            user_id = message.from_user.id
             if user_id not in self.usage:
-                self.usage[user_id] = UsageTracker(user_id, update.message.from_user.name)
+                self.usage[user_id] = UsageTracker(user_id, extract_username(message.from_user))
 
             try:
-                transcript = await self.openai.transcribe(filename_mp3)
+                transcript = await self.openai.transcribe(filename_mp3, transcribe_user_prompt)
 
                 transcription_price = self.config['transcription_price']
                 self.usage[user_id].add_transcription_seconds(audio_track.duration_seconds, transcription_price)
@@ -971,17 +1001,23 @@ class ChatGPTTelegramBot:
                     chunks = split_into_chunks(transcript_output)
 
                     for index, transcript_chunk in enumerate(chunks):
-                        sent_msg = await update.effective_message.reply_text(
-                            message_thread_id=get_forum_thread_id(update),
-                            reply_to_message_id=get_reply_to_message_id(self.config, update) if index == 0 else None,
+                        sent_msg = await message.reply_text(
                             text=transcript_chunk,
-                            parse_mode=constants.ParseMode.HTML,
+                            parse_mode=enums.ParseMode.HTML,
+                            reply_parameters=is_quoting_enabled(self.config, message) if index == 0 else None,
+                            #message_thread_id=get_forum_thread_id(message)
                         )
-                        self.save_reply(sent_msg, update)
+                        self.save_reply(sent_msg, message)
                 else:
+                    # when user input text after /stt command, for example if they want a more detailed transcriptions with timestamps or similar
+                    if transcribe_user_prompt:
+                        full_query = str(self.openai.config['stt_user_prompt']).format(transcript=transcript, transcribe_user_prompt=transcribe_user_prompt)
+                    else:
+                        full_query = transcript
+
                     # Get the response of the transcript
                     response, total_tokens = await self.openai.get_chat_response(
-                        chat_id=ai_context_id, query=transcript, user_id=str(user_id)
+                        chat_id=ai_context_id, query=full_query, user_id=str(user_id)
                     )
 
                     self.usage[user_id].add_chat_tokens(total_tokens, self.config['token_price'])
@@ -996,58 +1032,58 @@ class ChatGPTTelegramBot:
                     chunks = split_into_chunks(transcript_output)
 
                     for index, transcript_chunk in enumerate(chunks):
-                        sent_msg = await update.effective_message.reply_text(
-                            message_thread_id=get_forum_thread_id(update),
-                            reply_to_message_id=get_reply_to_message_id(self.config, update) if index == 0 else None,
+                        sent_msg = await message.reply_text(
                             text=transcript_chunk,
-                            parse_mode=constants.ParseMode.HTML,
-                            disable_web_page_preview=True,
+                            parse_mode=enums.ParseMode.HTML,
+                            link_preview_options=types.LinkPreviewOptions(is_disabled=True),
+                            reply_parameters=is_quoting_enabled(self.config, message) if index == 0 else None,
+                            #message_thread_id=get_forum_thread_id(message)
                         )
-                        self.save_reply(sent_msg, update)
+                        self.save_reply(sent_msg, message)
 
             except Exception as e:
-                logging.exception(e)
-                await update.effective_message.reply_text(
-                    message_thread_id=get_forum_thread_id(update),
-                    reply_to_message_id=get_reply_to_message_id(self.config, update),
+                self.logger.exception(e)
+                await message.reply_text(
                     text=f'{localized_text("transcribe_fail", bot_language)}: {str(e)}',
-                    parse_mode=constants.ParseMode.HTML,
+                    parse_mode=enums.ParseMode.HTML,
+                    reply_parameters=is_quoting_enabled(self.config, message),
+                    #message_thread_id=get_forum_thread_id(message)
                 )
             finally:
                 if os.path.exists(filename_mp3):
                     os.remove(filename_mp3)
-                if os.path.exists(filename):
-                    os.remove(filename)
+                if downloaded_path and os.path.exists(downloaded_path):
+                    os.remove(downloaded_path)
 
-        await wrap_with_indicator(update, context, _execute, constants.ChatAction.TYPING)
+        await wrap_with_indicator(client, message, _execute, enums.ChatAction.TYPING)
 
     @with_conversation_lock
-    async def vision(self, update: Update, context: ContextTypes.DEFAULT_TYPE, reply: Message = None):
-        await self._vision_no_lock(update, context, reply)
+    async def vision(self, client: Client, message: Message, reply: Message = None):
+        await self._vision_no_lock(client, message, reply)
 
-    async def _vision_no_lock(self, update: Update, context: ContextTypes.DEFAULT_TYPE, reply: Message = None):
+    async def _vision_no_lock(self, client: Client, message: Message, reply: Message = None):
         """
         Interpret image using vision model.
         """
-        if not self.config['enable_vision'] or not await self.check_allowed_and_within_budget(update, context):
+        if not self.config['enable_vision'] or not await self.check_allowed_and_within_budget(client, message):
             return
 
-        ai_context_id = self.get_thread_id(update)
-        chat_id = update.effective_chat.id
+        ai_context_id = self.get_thread_id(message)
+        chat_id = message.chat.id
 
         if reply is None:
-            prompt = update.message.caption
+            prompt = message.caption
         else:
-            prompt = message_text(update.message)
+            prompt = message_text(message)
 
-        if reply is None and is_group_chat(update):
+        if reply is None and is_group_chat(message):
             if self.config['ignore_group_vision']:
-                logging.info('Vision coming from group chat, ignoring...')
+                self.logger.info('Vision coming from group chat, ignoring...')
                 return
             else:
                 no_reply = (
-                    update.effective_message.reply_to_message is None
-                    or update.effective_message.reply_to_message.from_user.id != context.bot.id
+                    message.reply_to_message is None
+                    or message.reply_to_message.from_user.id != client.me.id
                 )
 
                 trigger_keyword = self.config['group_trigger_keyword']
@@ -1056,41 +1092,43 @@ class ChatGPTTelegramBot:
                 )
 
                 if no_reply and no_keyword:
-                    logging.info('Vision coming from group chat with wrong keyword, ignoring...')
+                    self.logger.info('Vision coming from group chat with wrong keyword, ignoring...')
                     return
-        elif reply and is_group_chat(update):
+        elif reply and is_group_chat(message):
             trigger_keyword = self.config['group_trigger_keyword']
             no_keyword = (prompt is None and trigger_keyword != '') or (
                 prompt is not None and not prompt.lower().startswith(trigger_keyword.lower())
             )
 
             if no_keyword:
-                logging.info('Vision coming from group chat with wrong keyword, ignoring...')
+                self.logger.info('Vision coming from group chat with wrong keyword, ignoring...')
                 return
 
-        effective_attachment = reply.effective_attachment if reply else update.message.effective_attachment
-        if isinstance(effective_attachment, Sequence):
-            image = effective_attachment[-1]
-        else:
-            image = effective_attachment
+        # In Pyrogram, we check message.photo or message.document
+        target_msg = reply if reply else message
+        image = target_msg.photo or target_msg.document
+        
+        if not image:
+            return
 
         async def _execute():
             bot_language = self.config['bot_language']
             total_tokens = 0
 
             try:
-                media_file = await context.bot.get_file(image.file_id)
-                temp_file = io.BytesIO(await media_file.download_as_bytearray())
+                # Pyrogram download_media
+                temp_file = await client.download_media(image, in_memory=True)
+                # temp_file is BytesIO
             except Exception as e:
-                logging.exception(e)
-                await update.effective_message.reply_text(
-                    message_thread_id=get_forum_thread_id(update),
-                    reply_to_message_id=get_reply_to_message_id(self.config, update),
+                self.logger.exception(e)
+                await message.reply_text(
                     text=(
                         f'{localized_text("media_download_fail", bot_language)[0]}: '
                         f'{str(e)}. {localized_text("media_download_fail", bot_language)[1]}'
                     ),
-                    parse_mode=constants.ParseMode.HTML,
+                    parse_mode=enums.ParseMode.HTML,
+                    reply_parameters=is_quoting_enabled(self.config, message),
+                    #message_thread_id=get_forum_thread_id(message)
                 )
                 return
 
@@ -1102,22 +1140,17 @@ class ChatGPTTelegramBot:
                 original_image = Image.open(temp_file)
 
                 original_image.save(temp_file_png, format='PNG')
-                logging.info(
-                    f'New vision request received from user {update.message.from_user.name} '
-                    f'(id: {update.message.from_user.id})'
+                self.logger.info(
+                    f'New vision request received from user {extract_username(message.from_user)} '
+                    f'(id: {message.from_user.id})'
                 )
 
             except Exception as e:
-                logging.exception(e)
-                # await update.effective_message.reply_text(
-                #     message_thread_id=get_forum_thread_id(update),
-                #     reply_to_message_id=get_reply_to_message_id(self.config, update),
-                #     text=localized_text('media_type_fail', bot_language),
-                # )
+                self.logger.exception(e)
 
-            user_id = update.message.from_user.id
+            user_id = message.from_user.id
             if user_id not in self.usage:
-                self.usage[user_id] = UsageTracker(user_id, update.message.from_user.name)
+                self.usage[user_id] = UsageTracker(user_id, extract_username(message.from_user))
 
             if self.config['stream']:
                 stream_response = self.openai.get_chat_response_stream(
@@ -1128,12 +1161,12 @@ class ChatGPTTelegramBot:
                 sent_message = None
                 backoff = 0
                 processed_chunks = []  # Track which chunks have been processed
-                is_group = is_group_chat(update)
+                is_group = is_group_chat(message)
                 str_chat_id = str(chat_id)
 
                 async for content, tokens in stream_response:
                     if is_direct_result(content):
-                        return await handle_direct_result(self.config, update, content, self.save_reply)
+                        return await handle_direct_result(self.config, message, content, self.save_reply)
 
                     if len(content.strip()) == 0:
                         continue
@@ -1151,13 +1184,13 @@ class ChatGPTTelegramBot:
                                     # Check rate limits before sending
                                     can_send = await self.rate_limiter.check_and_wait(str_chat_id, is_group)
                                     if not can_send:
-                                        logging.warning(f'Rate limit reached for chat {chat_id}, skipping update')
+                                        self.logger.warning(f'Rate limit reached for chat {chat_id}, skipping update')
                                         continue
 
                                     await edit_message_with_retry(
-                                        context,
+                                        client,
                                         chat_id,
-                                        str(sent_message.message_id),
+                                        sent_message.id,
                                         stream_chunks[chunk_idx],
                                     )
 
@@ -1165,19 +1198,19 @@ class ChatGPTTelegramBot:
                                 # Check rate limits before sending
                                 can_send = await self.rate_limiter.check_and_wait(str_chat_id, is_group)
                                 if not can_send:
-                                    logging.warning(f'Rate limit reached for chat {chat_id}, skipping new message')
+                                    self.logger.warning(f'Rate limit reached for chat {chat_id}, skipping new message')
                                     # Mark this chunk as processed anyway to avoid creating multiple messages later
                                     processed_chunks.append(chunk_idx)
                                     continue
 
-                                sent_message = await update.effective_message.reply_text(
-                                    message_thread_id=get_forum_thread_id(update),
+                                sent_message = await message.reply_text(
                                     text=content if len(content) > 0 else '...',
+                                    #message_thread_id=get_forum_thread_id(message)
                                 )
-                                self.save_reply(sent_message, update)
+                                self.save_reply(sent_message, message)
                                 processed_chunks.append(chunk_idx)
                             except Exception as e:
-                                logging.error(f'Error handling chunk: {e}')
+                                self.logger.error(f'Error handling chunk: {e}')
                                 pass
 
                         # If we've processed all complete chunks, continue streaming with the last chunk
@@ -1188,7 +1221,7 @@ class ChatGPTTelegramBot:
                             # We still have unprocessed complete chunks, skip this iteration
                             continue
 
-                    cutoff = get_stream_cutoff_values(update, content)
+                    cutoff = get_stream_cutoff_values(message, content)
                     cutoff += backoff
 
                     if i == 0:
@@ -1196,20 +1229,20 @@ class ChatGPTTelegramBot:
                             # Check rate limits before sending first message
                             can_send = await self.rate_limiter.check_and_wait(str_chat_id, is_group)
                             if not can_send:
-                                logging.warning(f'Rate limit reached for chat {chat_id}, waiting for next update')
+                                self.logger.warning(f'Rate limit reached for chat {chat_id}, waiting for next update')
                                 continue
 
                             if sent_message is not None:
-                                await context.bot.delete_message(
-                                    chat_id=sent_message.chat_id,
-                                    message_id=sent_message.message_id,
+                                await client.delete_messages(
+                                    chat_id=sent_message.chat.id,
+                                    message_ids=sent_message.id,
                                 )
-                            sent_message = await update.effective_message.reply_text(
-                                message_thread_id=get_forum_thread_id(update),
-                                reply_to_message_id=get_reply_to_message_id(self.config, update),
+                            sent_message = await message.reply_text(
                                 text=content,
+                                reply_parameters=is_quoting_enabled(self.config, message),
+                                #message_thread_id=get_forum_thread_id(message)
                             )
-                            self.save_reply(sent_message, update)
+                            self.save_reply(sent_message, message)
                         except:
                             continue
 
@@ -1229,26 +1262,21 @@ class ChatGPTTelegramBot:
                             # Otherwise, check rate limits and update if possible
                             can_send = await self.rate_limiter.check_and_wait(str_chat_id, is_group)
                             if not can_send:
-                                logging.warning(f'Rate limit reached for chat {chat_id}, skipping update')
+                                self.logger.warning(f'Rate limit reached for chat {chat_id}, skipping update')
                                 continue
 
                             use_markdown = tokens != 'not_finished'
                             await edit_message_with_retry(
-                                context,
+                                client,
                                 chat_id,
-                                str(sent_message.message_id),
+                                sent_message.id,
                                 text=content,
                                 markdown=use_markdown,
                             )
 
-                        except RetryAfter as e:
+                        except FloodWait as e:
                             backoff += 5
-                            await asyncio.sleep(e.retry_after)
-                            continue
-
-                        except TimedOut:
-                            backoff += 5
-                            await asyncio.sleep(0.5)
+                            await asyncio.sleep(e.value)
                             continue
 
                         except Exception:
@@ -1270,64 +1298,64 @@ class ChatGPTTelegramBot:
 
                     try:
                         # Check rate limits before sending
-                        is_group = is_group_chat(update)
+                        is_group = is_group_chat(message)
                         str_chat_id = str(chat_id)
                         can_send = await self.rate_limiter.check_and_wait(str_chat_id, is_group)
 
                         if can_send:
-                            sent_msg = await update.effective_message.reply_text(
-                                message_thread_id=get_forum_thread_id(update),
-                                reply_to_message_id=get_reply_to_message_id(self.config, update),
+                            sent_msg = await message.reply_text(
                                 text=interpretation,
-                                parse_mode=constants.ParseMode.HTML,
+                                parse_mode=enums.ParseMode.HTML,
+                                reply_parameters=is_quoting_enabled(self.config, message),
+                                #message_thread_id=get_forum_thread_id(message)
                             )
-                            self.save_reply(sent_msg, update)
+                            self.save_reply(sent_msg, message)
                         else:
                             # If rate limit reached, try without markdown
-                            logging.warning(f'Rate limit reached for chat {chat_id}, trying again in 1 second')
+                            self.logger.warning(f'Rate limit reached for chat {chat_id}, trying again in 1 second')
                             await asyncio.sleep(1)
                             can_send = await self.rate_limiter.check_and_wait(str_chat_id, is_group)
 
                             if can_send:
-                                sent_msg = await update.effective_message.reply_text(
-                                    message_thread_id=get_forum_thread_id(update),
-                                    reply_to_message_id=get_reply_to_message_id(self.config, update),
+                                sent_msg = await message.reply_text(
                                     text=interpretation,
+                                    reply_parameters=is_quoting_enabled(self.config, message),
+                                    #message_thread_id=get_forum_thread_id(message)
                                 )
-                                self.save_reply(sent_msg, update)
+                                self.save_reply(sent_msg, message)
                             else:
-                                logging.error('Failed to send vision response due to rate limits')
+                                self.logger.error('Failed to send vision response due to rate limits')
                     except BadRequest:
                         try:
                             # Check rate limits before retrying
-                            is_group = is_group_chat(update)
+                            is_group = is_group_chat(message)
                             str_chat_id = str(chat_id)
                             can_send = await self.rate_limiter.check_and_wait(str_chat_id, is_group)
 
                             if can_send:
-                                sent_msg = await update.effective_message.reply_text(
-                                    message_thread_id=get_forum_thread_id(update),
-                                    reply_to_message_id=get_reply_to_message_id(self.config, update),
+                                sent_msg = await message.reply_text(
                                     text=interpretation,
+                                    reply_parameters=is_quoting_enabled(self.config, message),
+                                    #message_thread_id=get_forum_thread_id(message)
                                 )
-                                self.save_reply(sent_msg, update)
+                                self.save_reply(sent_msg, message)
                             else:
-                                logging.error('Failed to send vision response due to rate limits')
+                                self.logger.error('Failed to send vision response due to rate limits')
                         except Exception as e:
-                            logging.exception(e)
-                            await update.effective_message.reply_text(
-                                message_thread_id=get_forum_thread_id(update),
-                                reply_to_message_id=get_reply_to_message_id(self.config, update),
+                            self.logger.exception(e)
+                            await message.reply_text(
                                 text=f'{localized_text("vision_fail", bot_language)}: {str(e)}',
-                                parse_mode=constants.ParseMode.HTML,
+                                parse_mode=enums.ParseMode.HTML,
+                                reply_parameters=is_quoting_enabled(self.config, message),
+                                #message_thread_id=get_forum_thread_id(message)
                             )
                 except Exception as e:
-                    logging.exception(e)
-                    await update.effective_message.reply_text(
-                        message_thread_id=get_forum_thread_id(update),
-                        reply_to_message_id=get_reply_to_message_id(self.config, update),
+                    self.logger.exception(e)
+                    await message.reply_text(
                         text=f'{localized_text("vision_fail", bot_language)}: {str(e)}',
-                        parse_mode=constants.ParseMode.HTML,
+                        parse_mode=enums.ParseMode.HTML,
+                        reply_parameters=is_quoting_enabled(self.config, message),
+                        #message_thread_id=get_forum_thread_id(message)
                     )
             vision_token_price = self.config['vision_token_price']
             self.usage[user_id].add_vision_tokens(total_tokens, vision_token_price)
@@ -1336,19 +1364,20 @@ class ChatGPTTelegramBot:
             if str(user_id) not in allowed_user_ids and 'guests' in self.usage:
                 self.usage['guests'].add_vision_tokens(total_tokens, vision_token_price)
 
-        await wrap_with_indicator(update, context, _execute, constants.ChatAction.TYPING)
+        await wrap_with_indicator(client, message, _execute, enums.ChatAction.TYPING)
 
-    async def reaction(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def reaction(self, client: Client, update: types.MessageReactionUpdated):
         """
         React to incoming reactions and respond accordingly.
         """
-        reaction_msg_key = (update.message_reaction.chat.id, update.message_reaction.message_id)
+        # Pyrogram MessageReactionUpdated
+        reaction_msg_key = (update.chat.id, update.message_id)
         if reaction_msg_key not in self.bot_message_ids:
             # prevent action on non-bot messages
             # prevent action on old messages which are not in the memory anymore
             return
 
-        if not update.message_reaction.new_reaction:
+        if not update.new_reaction:
             return
 
         emoji_to_message = {
@@ -1427,99 +1456,113 @@ class ChatGPTTelegramBot:
             '😡': 'This annoys me.',
         }
 
-        new_reactions = {r.emoji for r in update.message_reaction.new_reaction if isinstance(r, ReactionTypeEmoji)}
-        text = ''.join(emoji_to_message.get(emoji, '') for emoji in new_reactions)
+        new_reactions = {r.emoji for r in update.new_reaction if isinstance(r, types.ReactionTypeEmoji)}
+
+        if self.config.get('enable_raw_reaction'):
+            reaction_prompt = self.openai.config.get('reaction_prompt')
+            text_parts = []
+            for emoji in new_reactions:
+                try:
+                    formatted = reaction_prompt.format(reaction=emoji)
+                except Exception:
+                    formatted = reaction_prompt.replace('{reaction}', emoji)
+                
+                text_parts.append(formatted)
+            text = '\n'.join(text_parts)
+        else:
+            text = ''.join(emoji_to_message.get(emoji, '') for emoji in new_reactions)
+
         if not text.strip():
             return
 
-        logging.info(f'New reaction received from user {update.effective_sender.name} (TEXT: {text})')
+        self.logger.info(f'New reaction received from user {extract_username(update.user)} (TEXT: {text})')
 
-        new_update = Update(
-            update_id=update.update_id,
-            message=Message(  # required to behave like usual prompt
-                message_id=update.message_reaction.message_id,
-                date=update.message_reaction.date,
-                chat=update.message_reaction.chat,
-                from_user=update.message_reaction.user,
-                text=text,
-                reply_to_message=Message(  # required for context id resolving
-                    message_id=update.message_reaction.message_id,
-                    date=update.message_reaction.date,
-                    chat=update.message_reaction.chat,
-                    from_user=context.bot.bot,  # fake bot's message to bypass group trigger prefix
-                ),
+        fake_message = Message(
+            id=update.message_id,
+            date=update.date,
+            chat=update.chat,
+            from_user=update.user,
+            text=text,
+            reply_to_message=Message(
+                id=update.message_id,
+                date=update.date,
+                chat=update.chat,
+                from_user=client.me, # fake bot's message
             ),
+            client=client
         )
 
-        # required to enable shortcuts:
-        new_update.set_bot(update.get_bot())
-        new_update.message.set_bot(update.get_bot())
-
         # now call with fake compatible update
-        await self.prompt(new_update, context)
+        await self.prompt(client, fake_message)
 
     @with_conversation_lock
-    async def prompt(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await self._prompt_no_lock(update, context)
+    async def prompt(self, client: Client, message: Message):
+        await self._prompt_no_lock(client, message)
 
-    async def _prompt_no_lock(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def _prompt_no_lock(self, client: Client, message: Message):
         """
         React to incoming messages and respond accordingly.
         """
-        if update.edited_message or not update.message or update.message.via_bot:
+        if message.edit_date or not message.text or message.via_bot:
             return
 
-        if not await self.check_allowed_and_within_budget(update, context):
+        if not await self.check_allowed_and_within_budget(client, message):
             return
 
-        ai_context_id = self.get_thread_id(update)
-        logging.info(f'New message received from user {update.message.from_user.name} (CTX: {ai_context_id})')
-        chat_id = update.effective_chat.id
-        user_id = update.message.from_user.id
-        prompt = message_text(update.message)
+        ai_context_id = self.get_thread_id(message)
+        self.logger.info(f'New message received from user {extract_username(message.from_user)} (CTX: {ai_context_id})')
+        chat_id = message.chat.id
+        user_id = message.from_user.id
+        prompt = message_text(message)
         self.last_message[chat_id] = prompt
 
-        if update.message.reply_to_message and update.message.reply_to_message.effective_attachment:
-            attachment = update.message.reply_to_message.effective_attachment
-            if isinstance(attachment, Document) and attachment.mime_type == 'application/pdf':
-                with update._unfrozen() as editable_update:
-                    editable_update.message = update.message.reply_to_message
-                with update.message._unfrozen() as message:
-                    message.caption = prompt
+        if message.reply_to_message and (message.reply_to_message.document or message.reply_to_message.photo):
+            attachment = message.reply_to_message.document or message.reply_to_message.photo
+            if isinstance(attachment, types.Document) and attachment.mime_type == 'application/pdf':
+                # Modify message to point to reply
+                # In Pyrogram we can't easily modify the update structure like PTB
+                # We'll just call handle_pdf with the reply message but we need to pass the prompt (caption)
+                # handle_pdf expects the message with the PDF.
+                # So we call handle_pdf with reply_to_message, but we need to inject the caption/text from current message
+                
+                # Let's modify the reply_to_message object temporarily?
+                # Or better, pass the prompt explicitly to handle_pdf?
+                # handle_pdf reads message.caption.
+                message.reply_to_message.caption = prompt
+                return await self.handle_pdf(client, message.reply_to_message)
 
-                return await self.handle_pdf(update, context)
+            if message.reply_to_message.photo or message.reply_to_message.document:
+                 return await self._vision_no_lock(client, message, message.reply_to_message)
 
-            if isinstance(attachment, Sequence):
-                return await self._vision_no_lock(update, context, update.message.reply_to_message)
-
-        if is_group_chat(update):
+        if is_group_chat(message):
             trigger_keyword = self.config['group_trigger_keyword']
 
-            if prompt.lower().startswith(trigger_keyword.lower()) or update.message.text.lower().startswith('/chat'):
+            if prompt.lower().startswith(trigger_keyword.lower()) or message.text.lower().startswith('/chat'):
                 if prompt.lower().startswith(trigger_keyword.lower()):
                     prompt = prompt[len(trigger_keyword) :].strip()
 
                 if (
-                    update.message.reply_to_message
-                    and update.message.reply_to_message.text
-                    and update.message.reply_to_message.from_user.id != context.bot.id
+                    message.reply_to_message
+                    and message.reply_to_message.text
+                    and message.reply_to_message.from_user.id != client.me.id
                 ):
-                    reply_text = message_text(update.message.reply_to_message)
+                    reply_text = message_text(message.reply_to_message)
                     prompt = f'"{reply_text}"\n---\n{prompt}'
             else:
-                if update.message.reply_to_message and update.message.reply_to_message.from_user.id == context.bot.id:
-                    logging.info('Message is a reply to the bot, allowing...')
+                if message.reply_to_message and message.reply_to_message.from_user.id == client.me.id:
+                    self.logger.info('Message is a reply to the bot, allowing...')
                 else:
-                    logging.warning('Message does not start with trigger keyword, ignoring...')
+                    self.logger.warning('Message does not start with trigger keyword, ignoring...')
                     return
 
         try:
             total_tokens = 0
 
             if self.config['stream']:
-                await update.effective_message.reply_chat_action(
-                    action=constants.ChatAction.TYPING,
-                    message_thread_id=get_forum_thread_id(update),
+                await client.send_chat_action(
+                    chat_id=message.chat.id,
+                    action=enums.ChatAction.TYPING,
+                    message_thread_id=get_forum_thread_id(message)
                 )
 
                 stream_response = self.openai.get_chat_response_stream(
@@ -1530,12 +1573,12 @@ class ChatGPTTelegramBot:
                 sent_message = None
                 backoff = 0
                 processed_chunks = []  # Track which chunks have been processed
-                is_group = is_group_chat(update)
+                is_group = is_group_chat(message)
                 str_chat_id = str(chat_id)
 
                 async for content, tokens in stream_response:
                     if is_direct_result(content):
-                        return await handle_direct_result(self.config, update, content, self.save_reply)
+                        return await handle_direct_result(self.config, message, content, self.save_reply)
 
                     if len(content.strip()) == 0:
                         continue
@@ -1553,13 +1596,13 @@ class ChatGPTTelegramBot:
                                     # Check rate limits before sending
                                     can_send = await self.rate_limiter.check_and_wait(str_chat_id, is_group)
                                     if not can_send:
-                                        logging.warning(f'Rate limit reached for chat {chat_id}, skipping update')
+                                        self.logger.warning(f'Rate limit reached for chat {chat_id}, skipping update')
                                         continue
-
+    
                                     await edit_message_with_retry(
-                                        context,
+                                        client,
                                         chat_id,
-                                        str(sent_message.message_id),
+                                        sent_message.id,
                                         stream_chunks[chunk_idx],
                                     )
 
@@ -1567,21 +1610,21 @@ class ChatGPTTelegramBot:
                                 # Check rate limits before sending
                                 can_send = await self.rate_limiter.check_and_wait(str_chat_id, is_group)
                                 if not can_send:
-                                    logging.warning(f'Rate limit reached for chat {chat_id}, skipping new message')
+                                    self.logger.warning(f'Rate limit reached for chat {chat_id}, skipping new message')
                                     # Mark this chunk as processed anyway to avoid creating multiple messages later
                                     processed_chunks.append(chunk_idx)
                                     continue
-
-                                sent_message = await update.effective_message.reply_text(
-                                    message_thread_id=get_forum_thread_id(update),
+    
+                                sent_message = await message.reply_text(
                                     text=content if len(content) > 0 else '...',
+                                    #message_thread_id=get_forum_thread_id(message)
                                 )
-                                self.save_reply(sent_message, update)
+                                self.save_reply(sent_message, message)
                                 processed_chunks.append(chunk_idx)
                             except Exception as e:
-                                logging.error(f'Error handling chunk: {e}')
+                                self.logger.error(f'Error handling chunk: {e}')
                                 pass
-
+    
                         # If we've processed all complete chunks, continue streaming with the last chunk
                         if len(processed_chunks) == len(stream_chunks) - 1:
                             # We've handled all complete chunks, continue with normal streaming for the last chunk
@@ -1590,7 +1633,7 @@ class ChatGPTTelegramBot:
                             # We still have unprocessed complete chunks, skip this iteration
                             continue
 
-                    cutoff = get_stream_cutoff_values(update, content)
+                    cutoff = get_stream_cutoff_values(message, content)
                     cutoff += backoff
 
                     if i == 0:
@@ -1598,20 +1641,20 @@ class ChatGPTTelegramBot:
                             # Check rate limits before sending first message
                             can_send = await self.rate_limiter.check_and_wait(str_chat_id, is_group)
                             if not can_send:
-                                logging.warning(f'Rate limit reached for chat {chat_id}, waiting for next update')
+                                self.logger.warning(f'Rate limit reached for chat {chat_id}, waiting for next update')
                                 continue
 
                             if sent_message is not None:
-                                await context.bot.delete_message(
-                                    chat_id=sent_message.chat_id,
-                                    message_id=sent_message.message_id,
+                                await client.delete_messages(
+                                    chat_id=sent_message.chat.id,
+                                    message_ids=sent_message.id,
                                 )
-                            sent_message = await update.effective_message.reply_text(
-                                message_thread_id=get_forum_thread_id(update),
-                                reply_to_message_id=get_reply_to_message_id(self.config, update),
+                            sent_message = await message.reply_text(
                                 text=content,
+                                reply_parameters=is_quoting_enabled(self.config, message),
+                                #message_thread_id=get_forum_thread_id(message)
                             )
-                            self.save_reply(sent_message, update)
+                            self.save_reply(sent_message, message)
                         except:
                             continue
 
@@ -1631,26 +1674,21 @@ class ChatGPTTelegramBot:
                             # Otherwise, check rate limits and update if possible
                             can_send = await self.rate_limiter.check_and_wait(str_chat_id, is_group)
                             if not can_send:
-                                logging.warning(f'Rate limit reached for chat {chat_id}, skipping update')
+                                self.logger.warning(f'Rate limit reached for chat {chat_id}, skipping update')
                                 continue
-
+    
                             use_markdown = tokens != 'not_finished'
                             await edit_message_with_retry(
-                                context,
+                                client,
                                 chat_id,
-                                str(sent_message.message_id),
+                                sent_message.id,
                                 text=content,
                                 markdown=use_markdown,
                             )
 
-                        except RetryAfter as e:
+                        except FloodWait as e:
                             backoff += 5
-                            await asyncio.sleep(e.retry_after)
-                            continue
-
-                        except TimedOut:
-                            backoff += 5
-                            await asyncio.sleep(0.5)
+                            await asyncio.sleep(e.value)
                             continue
 
                         except Exception:
@@ -1673,13 +1711,13 @@ class ChatGPTTelegramBot:
                     )
 
                     if is_direct_result(response):
-                        return await handle_direct_result(self.config, update, response, self.save_reply)
+                        return await handle_direct_result(self.config, message, response, self.save_reply)
 
                     # Split into chunks of 4096 characters (Telegram's message limit)
                     chunks = split_into_chunks(response)
 
                     # Check if we're in a group
-                    is_group = is_group_chat(update)
+                    is_group = is_group_chat(message)
                     str_chat_id = str(chat_id)
 
                     for index, chunk in enumerate(chunks):
@@ -1688,83 +1726,79 @@ class ChatGPTTelegramBot:
                             can_send = await self.rate_limiter.check_and_wait(str_chat_id, is_group)
                             if not can_send:
                                 # If rate limit reached, add a delay and notify
-                                logging.warning(f'Rate limit reached for chat {chat_id}, waiting...')
+                                self.logger.warning(f'Rate limit reached for chat {chat_id}, waiting...')
                                 if index > 0:
                                     # Only add this notification for subsequent chunks
-                                    await update.effective_message.reply_text(
-                                        message_thread_id=get_forum_thread_id(update),
+                                    await message.reply_text(
                                         text='⚠️ Rate limit reached. Remaining response will be sent shortly.',
+                                        #message_thread_id=get_forum_thread_id(message)
                                     )
                                 await asyncio.sleep(60)  # Wait for a minute
                                 # Try again after waiting
                                 can_send = await self.rate_limiter.check_and_wait(str_chat_id, is_group)
 
                             if can_send:
-                                sent_msg = await update.effective_message.reply_text(
-                                    message_thread_id=get_forum_thread_id(update),
-                                    reply_to_message_id=get_reply_to_message_id(self.config, update)
-                                    if index == 0
-                                    else None,
+                                sent_msg = await message.reply_text(
                                     text=chunk,
-                                    parse_mode=constants.ParseMode.HTML,
-                                    disable_web_page_preview=True,
+                                    parse_mode=enums.ParseMode.HTML,
+                                    link_preview_options=types.LinkPreviewOptions(is_disabled=True),
+                                    reply_parameters=is_quoting_enabled(self.config, message) if index == 0 else None,
+                                    #message_thread_id=get_forum_thread_id(message)
                                 )
-                                self.save_reply(sent_msg, update)
+                                self.save_reply(sent_msg, message)
                             else:
-                                logging.error('Failed to send chunk due to rate limits even after waiting')
+                                self.logger.error('Failed to send chunk due to rate limits even after waiting')
                         except Exception:
                             try:
                                 # Check rate limits before retrying
                                 can_send = await self.rate_limiter.check_and_wait(str_chat_id, is_group)
                                 if not can_send:
-                                    logging.warning(f'Rate limit reached for chat {chat_id}, skipping chunk')
+                                    self.logger.warning(f'Rate limit reached for chat {chat_id}, skipping chunk')
                                     continue
 
-                                sent_msg = await update.effective_message.reply_text(
-                                    message_thread_id=get_forum_thread_id(update),
-                                    reply_to_message_id=get_reply_to_message_id(self.config, update)
-                                    if index == 0
-                                    else None,
+                                sent_msg = await message.reply_text(
                                     text=chunk,
-                                    disable_web_page_preview=True,
+                                    link_preview_options=types.LinkPreviewOptions(is_disabled=True),
+                                    reply_parameters=is_quoting_enabled(self.config, message) if index == 0 else None,
+                                    #message_thread_id=get_forum_thread_id(message)
                                 )
-                                self.save_reply(sent_msg, update)
+                                self.save_reply(sent_msg, message)
                             except Exception as exception:
                                 raise exception
 
-                await wrap_with_indicator(update, context, _reply, constants.ChatAction.TYPING)
+                await wrap_with_indicator(client, message, _reply, enums.ChatAction.TYPING)
 
             add_chat_request_to_usage_tracker(self.usage, self.config, user_id, total_tokens)
 
         except Exception as e:
-            logging.exception(e)
-            await update.effective_message.reply_text(
-                message_thread_id=get_forum_thread_id(update),
-                reply_to_message_id=get_reply_to_message_id(self.config, update),
+            self.logger.exception(e)
+            await message.reply_text(
                 text=f'{localized_text("chat_fail", self.config["bot_language"])} {str(e)}',
-                parse_mode=constants.ParseMode.HTML,
+                parse_mode=enums.ParseMode.HTML,
+                reply_parameters=is_quoting_enabled(self.config, message),
+                #message_thread_id=get_forum_thread_id(message)
             )
 
-    async def inline_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    async def inline_query(self, client: Client, inline_query: InlineQuery) -> None:
         """
         Handle the inline query. This is run when you type: @botusername <query>
         """
-        query = update.inline_query.query
-        user_id = update.inline_query.from_user.id
-        name = update.inline_query.from_user.name
+        query = inline_query.query
+        user_id = inline_query.from_user.id
+        name = extract_username(inline_query.from_user)
 
         if len(query) < 3:
             return
 
-        if not await self.check_allowed_and_within_budget(update, context, is_inline=True):
-            logging.warning(f'User {name} (id: {user_id}) not allowed or over budget')
+        if not await self.check_allowed_and_within_budget(client, inline_query, is_inline=True):
+            self.logger.warning(f'User {name} (id: {user_id}) not allowed or over budget')
             return
 
         result_id = str(uuid4())
         self.inline_queries_cache[result_id] = query
-        await self.send_inline_query_result(update, result_id, message_content=query)
+        await self.send_inline_query_result(client, inline_query, result_id, message_content=query)
 
-    async def send_inline_query_result(self, update: Update, result_id, message_content, callback_data=''):
+    async def send_inline_query_result(self, client: Client, inline_query: InlineQuery, result_id, message_content, callback_data=''):
         """
         Send inline query result with a placeholder message that will be updated with the actual response
         """
@@ -1783,42 +1817,41 @@ class ChatGPTTelegramBot:
             inline_query_result = InlineQueryResultArticle(
                 id=result_id,
                 title=localized_text('ask_chatgpt', bot_language),
-                input_message_content=InputTextMessageContent(placeholder_text, parse_mode=constants.ParseMode.HTML),
+                input_message_content=InputTextMessageContent(placeholder_text, parse_mode=enums.ParseMode.HTML),
                 description=message_content,
-                thumbnail_url='https://user-images.githubusercontent.com/11541888/223106202-7576ff11-2c8e-408d-94ea'
-                '-b02a7a32149a.png',
+                thumbnail_url='https://user-images.githubusercontent.com/11541888/223106202-7576ff11-2c8e-408d-94ea-b02a7a32149a.png',
                 reply_markup=reply_markup,
             )
 
-            await update.inline_query.answer([inline_query_result], cache_time=0)
+            await inline_query.answer([inline_query_result], cache_time=0)
         except Exception as e:
-            logging.error(f'Failed to send inline result for result_id {result_id}: {str(e)}')
-            logging.exception(e)
+            self.logger.error(f'Failed to send inline result for result_id {result_id}: {str(e)}')
+            self.logger.exception(e)
 
-    async def handle_chosen_inline_result(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    async def handle_chosen_inline_result(self, client: Client, chosen_inline_result: ChosenInlineResult) -> None:
         """
         Handle the chosen inline result and generate the response
         """
-        if not update.chosen_inline_result:
-            logging.warning('Received empty chosen_inline_result')
+        if not chosen_inline_result:
+            self.logger.warning('Received empty chosen_inline_result')
             return
 
-        result_id = update.chosen_inline_result.result_id
-        inline_message_id = update.chosen_inline_result.inline_message_id
-        user_id = update.chosen_inline_result.from_user.id
-        name = update.chosen_inline_result.from_user.name
+        result_id = chosen_inline_result.result_id
+        inline_message_id = chosen_inline_result.inline_message_id
+        user_id = chosen_inline_result.from_user.id
+        name = extract_username(chosen_inline_result.from_user)
 
         # Retrieve the query from cache
         query = self.inline_queries_cache.get(result_id)
         if not query:
-            logging.error(f'Query not found in cache for result_id: {result_id}')
+            self.logger.error(f'Query not found in cache for result_id: {result_id}')
             error_message = f'{localized_text("error", self.config["bot_language"])}. {localized_text("try_again", self.config["bot_language"])}'
             await edit_message_with_retry(
-                context, chat_id=None, message_id=inline_message_id, text=error_message, is_inline=True
+                client, chat_id=None, message_id=inline_message_id, text=error_message, is_inline=True
             )
             return
 
-        logging.info(f'User {name} (id: {user_id}) selected result_id: {result_id} ({query})')
+        self.logger.info(f'User {name} (id: {user_id}) selected result_id: {result_id} ({query})')
         self.inline_queries_cache.pop(result_id)
 
         bot_language = self.config['bot_language']
@@ -1837,10 +1870,10 @@ class ChatGPTTelegramBot:
                 backoff = 0
                 async for content, tokens in stream_response:
                     if is_direct_result(content):
-                        logging.info('Received direct result, not supported in inline mode')
+                        self.logger.info('Received direct result, not supported in inline mode')
                         unavailable_message = localized_text('function_unavailable_in_inline_mode', bot_language)
                         await edit_message_with_retry(
-                            context,
+                            client,
                             chat_id=None,
                             message_id=inline_message_id,
                             text=f'{query}\n\n<i>{answer_tr}:</i>\n{unavailable_message}',
@@ -1851,7 +1884,7 @@ class ChatGPTTelegramBot:
                     if len(content.strip()) == 0:
                         continue
 
-                    cutoff = get_stream_cutoff_values(update, content)
+                    cutoff = get_stream_cutoff_values(chosen_inline_result, content)
                     cutoff += backoff
 
                     if i == 0:
@@ -1859,11 +1892,11 @@ class ChatGPTTelegramBot:
                             # Check rate limits before sending first update
                             can_send = await self.rate_limiter.check_and_wait(str_user_id, False)
                             if not can_send:
-                                logging.warning(f'Rate limit reached for user {user_id}, waiting for next update')
+                                self.logger.warning(f'Rate limit reached for user {user_id}, waiting for next update')
                                 continue
 
                             await edit_message_with_retry(
-                                context,
+                                client,
                                 chat_id=None,
                                 message_id=inline_message_id,
                                 text=f'{query}\n\n{answer_tr}:\n{content}',
@@ -1887,7 +1920,7 @@ class ChatGPTTelegramBot:
                             # Check rate limits before updating message
                             can_send = await self.rate_limiter.check_and_wait(str_user_id, False)
                             if not can_send:
-                                logging.warning(f'Rate limit reached for user {user_id}, skipping update')
+                                self.logger.warning(f'Rate limit reached for user {user_id}, skipping update')
                                 continue
 
                             use_markdown = tokens != 'not_finished'
@@ -1897,7 +1930,7 @@ class ChatGPTTelegramBot:
                             text = text[:4096]
 
                             await edit_message_with_retry(
-                                context,
+                                client,
                                 chat_id=None,
                                 message_id=inline_message_id,
                                 text=text,
@@ -1905,13 +1938,9 @@ class ChatGPTTelegramBot:
                                 is_inline=True,
                             )
 
-                        except RetryAfter as e:
+                        except FloodWait as e:
                             backoff += 5
-                            await asyncio.sleep(e.retry_after)
-                            continue
-                        except TimedOut:
-                            backoff += 5
-                            await asyncio.sleep(0.5)
+                            await asyncio.sleep(e.value)
                             continue
                         except Exception:
                             backoff += 5
@@ -1929,10 +1958,10 @@ class ChatGPTTelegramBot:
                 # Check rate limits before sending
                 can_send = await self.rate_limiter.check_and_wait(str_user_id, False)
                 if can_send:
-                    await context.bot.edit_message_text(
+                    await client.edit_message_text(
                         inline_message_id=inline_message_id,
                         text=f'{query}\n\n<i>{answer_tr}:</i>\n{loading_tr}',
-                        parse_mode=constants.ParseMode.HTML,
+                        parse_mode=enums.ParseMode.HTML,
                     )
 
                 response, total_tokens = await self.openai.get_chat_response(
@@ -1940,14 +1969,14 @@ class ChatGPTTelegramBot:
                 )
 
                 if is_direct_result(response):
-                    logging.info('Received direct result, not supported in inline mode')
+                    self.logger.info('Received direct result, not supported in inline mode')
                     unavailable_message = localized_text('function_unavailable_in_inline_mode', bot_language)
 
                     # Check rate limits before sending final message
                     can_send = await self.rate_limiter.check_and_wait(str_user_id, False)
                     if can_send:
                         await edit_message_with_retry(
-                            context,
+                            client,
                             chat_id=None,
                             message_id=inline_message_id,
                             text=f'{query}\n\n<i>{answer_tr}:</i>\n{unavailable_message}',
@@ -1963,20 +1992,20 @@ class ChatGPTTelegramBot:
                 can_send = await self.rate_limiter.check_and_wait(str_user_id, False)
                 if can_send:
                     await edit_message_with_retry(
-                        context,
+                        client,
                         chat_id=None,
                         message_id=inline_message_id,
                         text=text_content,
                         is_inline=True,
                     )
                 else:
-                    logging.warning(f'Rate limit reached for user {user_id}, waiting to send final response')
+                    self.logger.warning(f'Rate limit reached for user {user_id}, waiting to send final response')
                     await asyncio.sleep(1)  # Wait a bit
                     # Try one more time
                     can_send = await self.rate_limiter.check_and_wait(str_user_id, False)
                     if can_send:
                         await edit_message_with_retry(
-                            context,
+                            client,
                             chat_id=None,
                             message_id=inline_message_id,
                             text=text_content,
@@ -1986,11 +2015,11 @@ class ChatGPTTelegramBot:
             add_chat_request_to_usage_tracker(self.usage, self.config, user_id, total_tokens)
 
         except Exception as e:
-            logging.error(f'Failed to respond to an inline query: {str(e)}')
-            logging.exception(e)
+            self.logger.error(f'Failed to respond to an inline query: {str(e)}')
+            self.logger.exception(e)
             localized_answer = localized_text('chat_fail', self.config['bot_language'])
             await edit_message_with_retry(
-                context,
+                client,
                 chat_id=None,
                 message_id=inline_message_id,
                 text=f'{query}\n\n<i>{answer_tr}:</i>\n{localized_answer} {str(e)}',
@@ -1998,7 +2027,7 @@ class ChatGPTTelegramBot:
             )
 
     async def check_allowed_and_within_budget(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, is_inline=False
+        self, client: Client, update: [Message, InlineQuery], is_inline=False
     ) -> bool:
         """
         Checks if the user is allowed to use the bot and if they are within their budget
@@ -2007,51 +2036,52 @@ class ChatGPTTelegramBot:
         :param is_inline: Boolean flag for inline queries
         :return: Boolean indicating if the user is allowed to use the bot
         """
-        name = update.inline_query.from_user.name if is_inline else update.message.from_user.name
-        user_id = update.inline_query.from_user.id if is_inline else update.message.from_user.id
+        name = extract_username(update.from_user)
+        user_id = update.from_user.id
 
-        if not await is_allowed(self.config, update, context, is_inline=is_inline):
-            logging.warning(f'User {name} (id: {user_id}) is not allowed to use the bot')
+        if not await is_allowed(self.config, client, update, is_inline=is_inline):
+            self.logger.warning(f'User {name} (id: {user_id}) is not allowed to use the bot')
             return False
         if not is_within_budget(self.config, self.usage, update, is_inline=is_inline):
-            logging.warning(f'User {name} (id: {user_id}) reached their usage limit')
-            await self.send_budget_reached_message(update, context, is_inline)
+            self.logger.warning(f'User {name} (id: {user_id}) reached their usage limit')
+            await self.send_budget_reached_message(client, update, is_inline)
             return False
 
         return True
 
-    async def send_disallowed_message(self, update: Update, _: ContextTypes.DEFAULT_TYPE, is_inline=False):
+    async def send_disallowed_message(self, client: Client, update: [Message, InlineQuery], is_inline=False):
         """
         Sends the disallowed message to the user.
         """
         if not is_inline:
-            await update.effective_message.reply_text(
-                message_thread_id=get_forum_thread_id(update),
+            await update.reply_text(
                 text=self.disallowed_message,
-                disable_web_page_preview=True,
+                link_preview_options=types.LinkPreviewOptions(is_disabled=True),
+                #message_thread_id=get_forum_thread_id(update)
             )
         else:
             result_id = str(uuid4())
-            await self.send_inline_query_result(update, result_id, message_content=self.disallowed_message)
+            await self.send_inline_query_result(client, update, result_id, message_content=self.disallowed_message)
 
-    async def send_budget_reached_message(self, update: Update, _: ContextTypes.DEFAULT_TYPE, is_inline=False):
+    async def send_budget_reached_message(self, client: Client, update: [Message, InlineQuery], is_inline=False):
         """
         Sends the budget reached message to the user.
         """
         if not is_inline:
-            await update.effective_message.reply_text(
-                message_thread_id=get_forum_thread_id(update), text=self.budget_limit_message
+            await update.reply_text(
+                text=self.budget_limit_message,
+                #message_thread_id=get_forum_thread_id(update)
             )
         else:
             result_id = str(uuid4())
-            await self.send_inline_query_result(update, result_id, message_content=self.budget_limit_message)
+            await self.send_inline_query_result(client, update, result_id, message_content=self.budget_limit_message)
 
-    async def post_init(self, application: Application) -> None:
+    async def post_init(self, client: Client) -> None:
         """
         Post initialization hook for the bot.
         """
-        await application.bot.set_my_commands(self.group_commands, scope=BotCommandScopeAllGroupChats())
-        await application.bot.set_my_commands(self.commands)
+        await client.set_bot_commands(self.group_commands, scope=BotCommandScopeAllGroupChats())
+        await client.set_bot_commands(self.commands)
 
         if self.config['database_url']:
             self.openai.db_pool = await asyncpg.create_pool(dsn=self.config['database_url'])
@@ -2059,40 +2089,223 @@ class ChatGPTTelegramBot:
                 await connection.execute('drop schema public cascade')
                 await connection.execute('create schema public')
 
-    async def post_shutdown(self, _: Application) -> None:
+    async def post_shutdown(self, client: Client) -> None:
         if self.openai.db_pool:
             await self.openai.db_pool.close()
 
-    async def handle_pdf(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    def _convert_tgs_to_mp4(self, tgs_data: bytes) -> Optional[bytes]:
         """
-        Extract text from PDF files and process as prompt.
+        Converts TGS (Lottie JSON) data to MP4 using lottie[video].
+        """
+        try:
+            with tempfile.NamedTemporaryFile(suffix='.tgs', delete=False) as temp_input:
+                temp_input.write(tgs_data)
+                temp_input_path = temp_input.name
 
-        FIX LOCKING; REWRITE AFTER AI
+            temp_output_path = temp_input_path + ".mp4"
+
+            try:
+                # Parse TGS
+                with open(temp_input_path, 'rb') as f:
+                    anim = parse_tgs(f)
+                
+                # Export to Video
+                export_video(anim, temp_output_path, fps=30)
+
+                if os.path.exists(temp_output_path):
+                    with open(temp_output_path, 'rb') as f:
+                        mp4_data = f.read()
+                    return mp4_data
+                return None
+            finally:
+                if os.path.exists(temp_input_path):
+                    os.remove(temp_input_path)
+                if os.path.exists(temp_output_path):
+                    os.remove(temp_output_path)
+
+        except Exception as e:
+            self.logger.error(f"Error converting TGS to MP4: {str(e)}")
+            return None
+
+    async def _handle_multimodal_input(self, client: Client, message: Message, media_type: str = None) -> bool:
         """
-        if not await self.check_allowed_and_within_budget(update, context):
+        Unified handler for multimodal input (audio, video, pdf, stickers, animations).
+        Returns True if handled (or rejected due to budget), False if not supported.
+        """
+        media = (
+            message.audio
+            or message.voice
+            or message.video
+            or message.video_note
+            or message.document
+            or message.sticker
+            or message.animation
+        )
+        if not media:
+            return False
+
+        # Determine media type if not provided
+        if not media_type:
+            if message.audio or message.voice:
+                media_type = 'audio'
+            elif message.video or message.video_note or message.animation:
+                media_type = 'video'
+            elif message.sticker:
+                if message.sticker.is_animated or message.sticker.is_video:
+                    media_type = 'video'
+                else:
+                    media_type = 'image'
+            elif message.document:
+                mime = (media.mime_type or '').lower()
+                if mime == 'application/pdf':
+                    media_type = 'pdf'
+                elif mime.startswith('audio/'):
+                    media_type = 'audio'
+                elif mime.startswith('video/'):
+                    media_type = 'video'
+                elif mime.startswith('image/'):
+                    media_type = 'image'
+                else:
+                    return False  # Unknown document type
+
+        # Check if media type is supported
+        # For images (stickers), we check enable_vision instead of supported_input
+        if media_type == 'image':
+            if not self.config.get('enable_vision', False):
+                return False
+        elif media_type not in self.openai.config['supported_input']:
+            return False
+
+        if not await self.check_allowed_and_within_budget(client, message):
+            return True  # Handled (rejected)
+
+        self.logger.info(
+            f'New {media_type} request received from user {extract_username(message.from_user)} (id: {message.from_user.id})'
+        )
+
+        async def _execute():
+            bot_language = self.config['bot_language']
+            try:
+                temp_file = await client.download_media(media, in_memory=True)
+                temp_file.seek(0)
+                media_bytes = temp_file.read()
+                # Check if we need to convert TGS to MP4
+                if message.sticker and message.sticker.is_animated:
+                    converted_bytes = await asyncio.to_thread(self._convert_tgs_to_mp4, media_bytes)
+                    if converted_bytes:
+                        media_bytes = converted_bytes
+                    else:
+                        self.logger.warning("TGS conversion failed, sending original data.")
+
+                media_base64 = base64.b64encode(media_bytes).decode('utf-8')
+
+                # Use actual mime type from Telegram object
+                mime_type = getattr(media, 'mime_type', '')
+
+                # Fallback for voice/video_note/sticker/animation if mime_type is missing
+                if not mime_type:
+                    if message.voice:
+                        mime_type = 'audio/ogg'
+                    elif message.video_note:
+                        mime_type = 'video/mp4'
+                    elif message.sticker:
+                        mime_type = 'image/webp'
+                    elif message.animation:
+                        mime_type = 'video/mp4'
+
+                # Fallback format if still empty
+                if not mime_type:
+                    if media_type == 'audio':
+                        mime_type = 'audio/mp3'
+                    elif media_type == 'video':
+                        mime_type = 'video/mp4'
+                    elif media_type == 'pdf':
+                        mime_type = 'application/pdf'
+                    elif media_type == 'image':
+                        mime_type = 'image/webp'
+
+                kwargs = {
+                    'chat_id': self.get_thread_id(message),
+                    'query': message.caption or message.text or "",
+                    'user_id': str(message.from_user.id),
+                }
+
+                if media_type == 'image':
+                    kwargs['image'] = f"data:{mime_type};base64,{media_base64}"
+                else:
+                    kwargs[media_type] = {'data': media_base64, 'format': mime_type}
+
+                response, total_tokens = await self.openai.get_chat_response(**kwargs)
+
+                chunks = split_into_chunks(response)
+                for index, chunk in enumerate(chunks):
+                    sent_msg = await message.reply_text(
+                        text=chunk,
+                        parse_mode=enums.ParseMode.HTML,
+                        reply_parameters=is_quoting_enabled(self.config, message) if index == 0 else None,
+                    )
+                    self.save_reply(sent_msg, message)
+
+                user_id = message.from_user.id
+                if user_id not in self.usage:
+                    self.usage[user_id] = UsageTracker(user_id, extract_username(message.from_user))
+                self.usage[user_id].add_chat_tokens(total_tokens, self.config['token_price'])
+
+            except Exception as e:
+                self.logger.exception(e)
+                await message.reply_text(
+                    text=f'{localized_text("error", bot_language)}: {str(e)}',
+                    parse_mode=enums.ParseMode.HTML,
+                    reply_parameters=is_quoting_enabled(self.config, message),
+                )
+
+        await wrap_with_indicator(client, message, _execute, enums.ChatAction.TYPING)
+        return True
+
+    @with_conversation_lock
+    async def handle_media(self, client: Client, message: Message):
+        """
+        Unified handler for media messages (audio, video, document).
+        """
+        # Try to handle as multimodal input first
+        if await self._handle_multimodal_input(client, message):
             return
 
-        caption = update.message.caption or ''
-        if is_group_chat(update):
+        # Fallback logic for PDF: Manual Text Extraction
+        if message.document and message.document.mime_type == 'application/pdf':
+            await self._handle_pdf_legacy(client, message)
+            return
+
+        # Handle image documents via vision
+        if message.document and (message.document.mime_type or '').startswith('image/'):
+            await self._vision_no_lock(client, message)
+
+    async def _handle_pdf_legacy(self, client: Client, message: Message):
+        """
+        Extract text from PDF files and process as prompt.
+        Legacy method for when PDF is not supported as multimodal input.
+        """
+        if not await self.check_allowed_and_within_budget(client, message):
+            return
+
+        caption = message.caption or ''
+        if is_group_chat(message):
             trigger_keyword = self.config['group_trigger_keyword']
 
             if not caption.lower().startswith(trigger_keyword.lower()):
                 # If it's a reply to bot, allow, otherwise ignore
-                if update.message.reply_to_message and update.message.reply_to_message.from_user.id == context.bot.id:
-                    logging.info('PDF is a reply to the bot, allowing...')
+                if message.reply_to_message and message.reply_to_message.from_user.id == client.me.id:
+                    self.logger.info('PDF is a reply to the bot, allowing...')
                 else:
-                    logging.warning('PDF caption does not start with trigger keyword, ignoring...')
+                    self.logger.warning('PDF caption does not start with trigger keyword, ignoring...')
                     return
 
-        logging.info(f'New PDF received from user {update.message.from_user.name} (id: {update.message.from_user.id})')
+        self.logger.info(f'New PDF received from user {extract_username(message.from_user)} (id: {message.from_user.id})')
 
         async def _process_pdf():
             try:
-                pdf_file = await context.bot.get_file(update.message.document.file_id)
-
-                with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_pdf:
-                    await pdf_file.download_to_drive(temp_pdf.name)
-                    temp_path = temp_pdf.name
+                # Pyrogram download_media
+                temp_path = await client.download_media(message.document)
 
                 extracted_text = ''
                 try:
@@ -2111,10 +2324,10 @@ class ChatGPTTelegramBot:
                             break
 
                 except Exception as e:
-                    logging.exception(e)
-                    await update.effective_message.reply_text(
-                        message_thread_id=get_forum_thread_id(update),
+                    self.logger.exception(e)
+                    await message.reply_text(
                         text=f'Error extracting text from PDF: {str(e)}',
+                        #message_thread_id=get_forum_thread_id(message)
                     )
                     return
                 finally:
@@ -2123,9 +2336,9 @@ class ChatGPTTelegramBot:
                         os.remove(temp_path)
 
                 if not extracted_text.strip():
-                    await update.effective_message.reply_text(
-                        message_thread_id=get_forum_thread_id(update),
+                    await message.reply_text(
                         text='No text could be extracted from the PDF. It might be scanned or contain only images.',
+                        #message_thread_id=get_forum_thread_id(message)
                     )
                     return
 
@@ -2133,87 +2346,76 @@ class ChatGPTTelegramBot:
                     f'{caption}\n---\nPDF Content:\n{extracted_text}' if caption else f'PDF Content:\n{extracted_text}'
                 )
 
-                with update.message._unfrozen() as message:
-                    message.text = prompt
+                # Modify message text to be the prompt
+                message.text = prompt
 
-                await self._prompt_no_lock(update, context)
+                await self._prompt_no_lock(client, message)
 
             except Exception as e:
-                logging.exception(e)
-                await update.effective_message.reply_text(
-                    message_thread_id=get_forum_thread_id(update),
+                self.logger.exception(e)
+                await message.reply_text(
                     text=f'Failed to process PDF: {str(e)}',
+                    #message_thread_id=get_forum_thread_id(message)
                 )
 
-        await wrap_with_indicator(update, context, _process_pdf, constants.ChatAction.TYPING)
+        await wrap_with_indicator(client, message, _process_pdf, enums.ChatAction.TYPING)
 
     def run(self):
         """
         Runs the bot indefinitely until the user presses Ctrl+C
         """
-        application = (
-            ApplicationBuilder()
-            .token(self.config['token'])
-            .proxy(self.config['proxy'])
-            .get_updates_proxy(self.config['proxy'])
-            .post_init(self.post_init)
-            .post_shutdown(self.post_shutdown)
-            .concurrent_updates(True)
-            .pool_timeout(60.0)
-            .media_write_timeout(60.0)
-            .connect_timeout(15.0)
-            .build()
-        )
+        # Register handlers
+        self.client.add_handler(MessageHandler(self.reset, filters.command("reset")))
+        self.client.add_handler(MessageHandler(self.image, filters.command("image")))
+        self.client.add_handler(MessageHandler(self.tts, filters.command("tts")))
+        self.client.add_handler(MessageHandler(self.transcribe, filters.command("stt")))
 
-        application.add_handler(CommandHandler('reset', self.reset))
-        application.add_handler(CommandHandler('image', self.image))
-        application.add_handler(CommandHandler('tts', self.tts))
-        # application.add_handler(CommandHandler('start', self.help))
-        # application.add_handler(CommandHandler('stats', self.stats))
-        # application.add_handler(CommandHandler('resend', self.resend))
-        # application.add_handler(
-        #     CommandHandler(
-        #         'chat',
-        #         self.prompt,
-        #         filters=filters.ChatType.GROUP | filters.ChatType.SUPERGROUP,
-        #     )
-        # )
-        application.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, self.vision))
-        application.add_handler(
+        self.client.add_handler(MessageHandler(self.vision, filters.photo))
+        self.client.add_handler(
             MessageHandler(
-                filters.AUDIO
-                | filters.VOICE
-                | filters.Document.AUDIO
-                | filters.VIDEO
-                | filters.VIDEO_NOTE
-                | filters.Document.VIDEO,
-                self.transcribe,
+                self.handle_media,
+                filters.audio
+                | filters.voice
+                | filters.video
+                | filters.video_note
+                | filters.document
+                | filters.sticker
+                | filters.animation,
             )
         )
-        application.add_handler(MessageHandler(filters.Document.PDF, self.handle_pdf))
-        application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), self.prompt))
-        application.add_handler(
-            MessageReactionHandler(
-                self.reaction, message_reaction_types=MessageReactionHandler.MESSAGE_REACTION_UPDATED
+        
+        # should be similar to PTB filters.COMMAND
+        async def is_any_command(_, __, message):
+            text = message.text or message.caption
+            if not isinstance(text, str) or not text.startswith("/"):
+                return False
+            cmd = text.split()[0][1:]
+            if "@" in cmd:
+                cmd_name, bot = cmd.split("@", 1)
+                return bot.lower() == message._client.name.lower()
+            return True
+        
+        self.client.add_handler(MessageHandler(self.prompt, filters.text & ~filters.create(is_any_command)))
+        
+        self.client.add_handler(
+            MessageReactionUpdatedHandler(
+                self.reaction
             )
         )
-        application.add_handler(CallbackQueryHandler(self.handle_improve_quality, pattern='^improve_quality:'))
-        application.add_handler(CallbackQueryHandler(self.handle_show_quality, pattern='^show_quality:'))
-        application.add_handler(CallbackQueryHandler(self.handle_quality_confirmation, pattern='^confirm_quality:'))
-        application.add_handler(CallbackQueryHandler(self.handle_quality_cancel, pattern='^cancel_quality:'))
-        application.add_handler(
+        
+        self.client.add_handler(CallbackQueryHandler(self.handle_improve_quality, filters.regex('^improve_quality:')))
+        self.client.add_handler(CallbackQueryHandler(self.handle_show_quality, filters.regex('^show_quality:')))
+        self.client.add_handler(CallbackQueryHandler(self.handle_quality_confirmation, filters.regex('^confirm_quality:')))
+        self.client.add_handler(CallbackQueryHandler(self.handle_quality_cancel, filters.regex('^cancel_quality:')))
+        
+        self.client.add_handler(
             InlineQueryHandler(
-                self.inline_query,
-                chat_types=[
-                    constants.ChatType.GROUP,
-                    constants.ChatType.SUPERGROUP,
-                    constants.ChatType.PRIVATE,
-                ],
+                self.inline_query
             )
         )
-        # Add handler for chosen inline results
-        application.add_handler(ChosenInlineResultHandler(self.handle_chosen_inline_result))
+        
+        self.client.add_handler(ChosenInlineResultHandler(self.handle_chosen_inline_result))
 
-        application.add_error_handler(error_handler)
-
-        application.run_polling(allowed_updates=Update.ALL_TYPES)
+        # Start the client
+        self.logger.info("Starting bot...")
+        self.client.run()

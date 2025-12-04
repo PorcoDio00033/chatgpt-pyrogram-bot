@@ -5,7 +5,6 @@ import base64
 import datetime
 import io
 import json
-import logging
 import os
 from collections import Counter
 from typing import TYPE_CHECKING, List, Optional, TypedDict, Union
@@ -16,118 +15,29 @@ import openai
 from openai._utils import async_maybe_transform
 from openai.types import CompletionUsage
 from openai.types.chat import ChatCompletionMessageParam
+from config import (
+    GPT_4_128K_MODELS,
+    GPT_4_32K_MODELS,
+    GPT_4_MODELS,
+    GPT_4_VISION_MODELS,
+    GPT_41_MODELS,
+    GPT_4O_MODELS,
+    GPT_5_MODELS,
+    GPT_SEARCH_MODELS,
+)
 from openai.types.images_response import Usage
 from plugin_manager import PluginManager
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential_jitter
+
+from chill_logging import get_logger_instance
 from utils import is_direct_result
+
+logger = get_logger_instance("openai_helper").logger
 
 if TYPE_CHECKING:
     from openai.types.chat import ChatCompletionMessageToolCall
     from openai.types.chat.chat_completion_chunk import ChoiceDeltaToolCall
 
-# Models can be found here: https://platform.openai.com/docs/models/overview
-GPT_4_MODELS = ('gpt-4', 'gpt-4-0314', 'gpt-4-0613', 'gpt-4-turbo-preview')
-GPT_4_32K_MODELS = ('gpt-4-32k', 'gpt-4-32k-0314', 'gpt-4-32k-0613')
-GPT_4_VISION_MODELS = (
-    'gpt-4o',
-    'gpt-4o-mini',
-    'gpt-4.1',
-    'gpt-4.1-mini',
-    'gpt-4.1-nano',
-)
-GPT_4_128K_MODELS = (
-    'gpt-4-1106-preview',
-    'gpt-4-0125-preview',
-    'gpt-4-turbo-preview',
-    'gpt-4-turbo',
-    'gpt-4-turbo-2024-04-09',
-)
-GPT_4O_MODELS = (
-    'gpt-4o',
-    'gpt-4o-mini',
-    'gpt-4o-2024-08-06',
-    'gpt-4o-2024-05-13',
-    'gpt-4o-mini-2024-07-18',
-    'gpt-4o-search-preview',
-    'gpt-4o-mini-search-preview',
-)
-GPT_41_MODELS = (
-    'gpt-4.1',
-    'gpt-4.1-mini',
-    'gpt-4.1-nano',
-    'gpt-4.1-2025-04-14',
-    'gpt-4.1-mini-2025-04-14',
-    'gpt-4.1-nano-2025-04-14',
-)
-GPT_5_MODELS = (
-    'gpt-5.1',
-    'gpt-5.1-2025-11-13',
-    'gpt-5.1-codex',
-    'gpt-5.1-codex-mini',
-    'gpt-5.1-chat-latest',
-    'gpt-5',
-    'gpt-5-mini',
-    'gpt-5-nano',
-    'gpt-5-2025-08-07',
-    'gpt-5-mini-2025-08-07',
-    'gpt-5-nano-2025-08-07',
-    'gpt-5-chat-latest',
-)
-GPT_SEARCH_MODELS = (
-    'gpt-4o-search-preview',
-    'gpt-4o-mini-search-preview',
-)
-GPT_ALL_MODELS = (
-    GPT_4_MODELS
-    + GPT_4_32K_MODELS
-    + GPT_4_VISION_MODELS
-    + GPT_4_128K_MODELS
-    + GPT_4O_MODELS
-    + GPT_41_MODELS
-    + GPT_5_MODELS
-    + GPT_SEARCH_MODELS
-)
-
-
-def default_max_output_tokens(model: str) -> int:
-    """
-    Gets the default number of max OUTPUT tokens for the given model.
-    :param model: The model name
-    :return: The default number of max tokens
-    """
-    base = 1024
-    if model in GPT_4_MODELS:
-        return base * 2
-    elif model in GPT_4_32K_MODELS:
-        return base * 8
-    elif model in GPT_4_128K_MODELS:
-        return base * 8
-    elif model in GPT_4O_MODELS:
-        return base * 16
-    elif model in GPT_41_MODELS:
-        return base * 32
-    elif model in GPT_5_MODELS:
-        return base * 32
-
-    return base
-
-
-def are_functions_available(model: str) -> bool:
-    """
-    Whether the given model supports functions
-    """
-    # Stable models will be updated to support functions on June 27, 2023
-    if model in (
-        'gpt-4',
-        'gpt-4-32k',
-        'gpt-4-1106-preview',
-        'gpt-4-0125-preview',
-        'gpt-4-turbo-preview',
-    ):
-        return datetime.date.today() > datetime.date(2023, 6, 27)
-    if model in GPT_SEARCH_MODELS:
-        return False
-    return True
 
 
 _MODELS_COST = {
@@ -209,12 +119,12 @@ def localized_text(key, bot_language):
     try:
         return translations[bot_language][key]
     except KeyError:
-        logging.warning(f"No translation available for bot_language code '{bot_language}' and key '{key}'")
+        logger.warning(f"No translation available for bot_language code '{bot_language}' and key '{key}'")
         # Fallback to English if the translation is not available
         if key in translations['en']:
             return translations['en'][key]
         else:
-            logging.warning(f"No english definition found for key '{key}' in translations.json")
+            logger.warning(f"No english definition found for key '{key}' in translations.json")
             # return key as text
             return key
 
@@ -252,7 +162,7 @@ class OpenAIHelper:
             return
 
         if chat_id.split('_')[0] not in self.config['allowed_chat_ids_to_track']:
-            logging.debug(f'Chat ID {chat_id} is not allowed to be tracked')
+            logger.debug(f'Chat ID {chat_id} is not allowed to be tracked')
             return
 
         async with self.db_pool.acquire() as conn:
@@ -270,14 +180,14 @@ class OpenAIHelper:
                 """
             )
 
-        logging.debug(f'Chat ID {chat_id} is now being tracked')
+        logger.debug(f'Chat ID {chat_id} is now being tracked')
 
     async def add_conv_in_db(self, chat_id: str, role: str, content: str, name: Optional[str] = None) -> None:
         if not self.db_pool:
             return
 
         if chat_id.split('_')[0] not in self.config['allowed_chat_ids_to_track']:
-            logging.debug(f'Chat ID {chat_id} is not allowed to be tracked')
+            logger.debug(f'Chat ID {chat_id} is not allowed to be tracked')
             return
 
         async with self.db_pool.acquire() as conn:
@@ -287,7 +197,7 @@ class OpenAIHelper:
                 """)
             await prepared.fetchval(role, name, content)
 
-        logging.debug(f'Added message to chat ID {chat_id} history')
+        logger.debug(f'Added message to chat ID {chat_id} history')
 
     async def get_conversation_stats(self, chat_id: str) -> tuple[int, int]:
         """
@@ -300,18 +210,30 @@ class OpenAIHelper:
         return len(self.conversations[chat_id]), self.get_tokens(chat_id)
 
     async def get_chat_response(
-        self, chat_id: str, query: str, image: Optional[str] = None, user_id: Optional[str] = None
+        self,
+        chat_id: str,
+        query: str,
+        image: Optional[str] = None,
+        audio: Optional[dict] = None,
+        video: Optional[dict] = None,
+        pdf: Optional[dict] = None,
+        user_id: Optional[str] = None,
     ) -> tuple[str, int]:
         """
         Gets a full response from the GPT model.
         :param chat_id: The chat ID
         :param query: The query to send to the model
         :param image: The image to send to the model
+        :param audio: The audio to send to the model
+        :param video: The video to send to the model
+        :param pdf: The pdf to send to the model
         :param user_id: The user ID for tracking
         :return: The answer from the model and the number of tokens used
         """
         plugins_used = []
-        response = await self.__common_get_chat_response(chat_id, query, image=image, user_id=user_id)
+        response = await self.__common_get_chat_response(
+            chat_id, query, image=image, audio=audio, video=video, pdf=pdf, user_id=user_id
+        )
         if self.config['enable_functions']:
             response, _, plugins_used = await self.__handle_function_call(chat_id, response, user_id=user_id)
             if is_direct_result(response):
@@ -339,13 +261,13 @@ class OpenAIHelper:
                     end = annotation.url_citation.end_index + offset
 
                     # Insert citation reference number
-                    citation_text = f'\[{i}]'
+                    citation_text = f'\\[{i}]'
                     answer = answer[:start] + citation_text + answer[end:]
 
                     # Update offset for next citation
                     offset += len(citation_text) - (end - start)
 
-                    citations.append(f'- \[{i}] [{annotation.url_citation.title}]({annotation.url_citation.url})')
+                    citations.append(f'- \\[{i}] [{annotation.url_citation.title}]({annotation.url_citation.url})')
                 if citations:
                     answer += '\n\n🌐 References:\n' + '\n'.join(citations)
 
@@ -370,18 +292,30 @@ class OpenAIHelper:
         return answer, response.usage.total_tokens
 
     async def get_chat_response_stream(
-        self, chat_id: str, query: str, image: Optional[str] = None, user_id: Optional[str] = None
+        self,
+        chat_id: str,
+        query: str,
+        image: Optional[str] = None,
+        audio: Optional[dict] = None,
+        video: Optional[dict] = None,
+        pdf: Optional[dict] = None,
+        user_id: Optional[str] = None,
     ):
         """
         Stream response from the GPT model.
         :param chat_id: The chat ID
         :param query: The query to send to the model
         :param image: The image to send to the model
+        :param audio: The audio to send to the model
+        :param video: The video to send to the model
+        :param pdf: The pdf to send to the model
         :param user_id: The user ID for tracking
         :return: The answer from the model and the number of tokens used, or 'not_finished'
         """
         plugins_used = []
-        response = await self.__common_get_chat_response(chat_id, query, stream=True, image=image, user_id=user_id)
+        response = await self.__common_get_chat_response(
+            chat_id, query, stream=True, image=image, audio=audio, video=video, pdf=pdf, user_id=user_id
+        )
         if self.config['enable_functions']:
             response, response_chunks, plugins_used = await self.__handle_function_call(
                 chat_id, response, stream=True, user_id=user_id
@@ -422,7 +356,7 @@ class OpenAIHelper:
         elif show_plugins_used:
             answer += f'\n\n---\n🔌 {", ".join(plugin_names)}'
 
-        yield answer, usage.total_tokens
+        yield answer, usage.total_tokens if usage else 0 # prevents crash if openai fails/doesn't return usage
 
     def get_conversation_lock(self, chat_id: str) -> asyncio.Lock:
         """
@@ -441,7 +375,15 @@ class OpenAIHelper:
         stop=stop_after_attempt(5),
     )
     async def __common_get_chat_response(
-        self, chat_id: str, query: str, stream=False, image: Optional[str] = None, user_id: Optional[str] = None
+        self,
+        chat_id: str,
+        query: str,
+        stream=False,
+        image: Optional[str] = None,
+        audio: Optional[dict] = None,
+        video: Optional[dict] = None,
+        pdf: Optional[dict] = None,
+        user_id: Optional[str] = None,
     ):
         """
         Request a response from the GPT model.
@@ -475,6 +417,46 @@ class OpenAIHelper:
                         ],
                     )
 
+                if 'audio' in self.config['supported_input'] and audio:
+                    await self.__add_to_history(
+                        chat_id,
+                        role='user',
+                        content=[
+                            {
+                                'type': 'input_audio',
+                                'input_audio': {'data': audio['data'], 'format': audio['format']},
+                            },
+                        ],
+                    )
+
+                if 'video' in self.config['supported_input'] and video:
+                    await self.__add_to_history(
+                        chat_id,
+                        role='user',
+                        content=[
+                            {
+                                'type': 'input_video',
+                                'input_video': {'data': video['data'], 'format': video['format']},
+                            },
+                        ],
+                    )
+
+                if 'pdf' in self.config['supported_input'] and pdf:
+                    await self.__add_to_history(
+                        chat_id,
+                        role='user',
+                        content=[
+                            {
+                                'type': 'text',
+                                'text': self.config['pdf_prompt']
+                            },
+                            {
+                                'type': 'input_pdf',
+                                'input_pdf': {'data': pdf['data']},
+                            },
+                        ],
+                    )
+
             await _add_to_history()
 
             # Summarize the chat history if it's too long to avoid excessive token usage
@@ -484,15 +466,15 @@ class OpenAIHelper:
             exceeded_max_history_size = len(self.conversations[chat_id]) > self.config['max_history_size']
 
             if exceeded_max_tokens or exceeded_max_history_size:
-                logging.info(f'Chat history for chat ID {chat_id} is too long. Summarising...')
+                logger.info(f'Chat history for chat ID {chat_id} is too long. Summarising...')
                 try:
                     summary = await self.__summarise(self.conversations[chat_id][:-1], user_id)
-                    logging.debug(f'Summary: {summary}')
+                    logger.debug(f'Summary: {summary}')
                     await self.reset_chat_history(chat_id, self.conversations[chat_id][0]['content'])
                     await self.__add_to_history(chat_id, role='assistant', content=summary)
                     await _add_to_history()
                 except Exception as e:
-                    logging.warning(f'Error while summarising chat history: {str(e)}. Popping elements instead...')
+                    logger.warning(f'Error while summarising chat history: {str(e)}. Popping elements instead...')
                     # FIXME update in DB
                     self.conversations[chat_id] = [self.conversations[chat_id][0]] + self.conversations[chat_id][
                         -self.config['max_history_size'] - 1 :
@@ -552,7 +534,7 @@ class OpenAIHelper:
             raise Exception(f'⚠️ <i>{localized_text("error", bot_language)}.</i> ⚠️\n{str(e)}') from e
 
     async def __call_functions_in_parallel(self, chat_id, final_tool_calls, times, cost, plugins_used):
-        logging.info(
+        logger.info(
             f'[FUNC CALL][{times}] Calling functions in parallel: {list(f.function.name for f in final_tool_calls.values())}'
         )
 
@@ -561,7 +543,7 @@ class OpenAIHelper:
             function_name = tool_call.function.name
             arguments = tool_call.function.arguments
 
-            logging.info(f'[FUNC CALL][{times}] Calling "{function_name}" with arguments {arguments}')
+            logger.info(f'[FUNC CALL][{times}] Calling "{function_name}" with arguments {arguments}')
             task = asyncio.create_task(self.plugin_manager.call_function(chat_id, function_name, self, arguments))
             tasks.append((tool_call, function_name, task))
 
@@ -573,12 +555,12 @@ class OpenAIHelper:
             plugins_used.append(function_name)
 
             price = get_formatted_price(cost)
-            logging.info(
+            logger.info(
                 f'[FUNC CALL][{times}] "{function_name}" costed {price} returned {function_response_json[:100]}'
             )
 
             if is_direct_result(function_response):
-                logging.info(f'[FUNC CALL][{times}] "{function_name}" returned a direct result')
+                logger.info(f'[FUNC CALL][{times}] "{function_name}" returned a direct result')
                 await self.__add_tool_call_to_history(chat_id, tool_call)
                 await self.__add_tool_call_result_to_history(
                     chat_id=chat_id,
@@ -620,8 +602,8 @@ class OpenAIHelper:
 
                     if index not in final_tool_calls:
                         final_tool_calls[index] = tool_call
-
-                    final_tool_calls[index].function.arguments += tool_call.function.arguments
+                    else:
+                        final_tool_calls[index].function.arguments += tool_call.function.arguments
 
                 if first_choice.finish_reason == 'tool_calls':
                     break
@@ -730,7 +712,7 @@ class OpenAIHelper:
             response = await method(**generate_kwargs)
 
             if len(response.data) == 0:
-                logging.error(f'No response from GPT: {str(response)}')
+                logger.error(f'No response from GPT: {str(response)}')
                 raise Exception(
                     f'⚠️ <i>{localized_text("error", bot_language)}.</i> ⚠️\n{localized_text("try_again", bot_language)}.'
                 )
@@ -769,20 +751,26 @@ class OpenAIHelper:
         except Exception as e:
             raise Exception(f'⚠️ <i>{localized_text("error", bot_language)}.</i> ⚠️\n{str(e)}') from e
 
-    async def transcribe(self, filename):
+    async def transcribe(self, filename, prompt: Optional[str] = None):
         # FIXME do not use filename; use fileobj instead
         """
         Transcribes the audio file using the Whisper model.
         """
         try:
             async with aiofiles.open(filename, mode='rb') as audio:
-                prompt_text = self.config['whisper_prompt']
-                result = await self.client.audio.transcriptions.create(
-                    model='whisper-1', file=audio, prompt=prompt_text
-                )
-                return result.text
+                content = await audio.read()
+
+            # Create a file-like object from the bytes
+            audio_file = io.BytesIO(content)
+            audio_file.name = filename
+
+            prompt_text = prompt if prompt else self.config['whisper_prompt']
+            result = await self.client.audio.transcriptions.create(
+                model=self.config['whisper_model'], file=audio_file, prompt=prompt_text
+            )
+            return result.text
         except Exception as e:
-            logging.exception(e)
+            logger.exception(e)
             raise Exception(f'⚠️ <i>{localized_text("error", self.config["bot_language"])}.</i> ⚠️\n{str(e)}') from e
 
     async def reset_chat_history(self, chat_id: str, content: Optional[str] = None):
@@ -917,4 +905,6 @@ class OpenAIHelper:
             return base * 240  # 1M
         if self.config['model'] in GPT_5_MODELS:
             return base * 97  # ~400k
-        raise NotImplementedError(f'Max tokens for model {self.config["model"]} is not implemented yet.')
+        if self.config['max_model_tokens']:
+            return self.config['max_model_tokens']
+        raise NotImplementedError(f'Max tokens for model {self.config["model"]} is not implemented yet. For custom models set MAX_MODEL_TOKENS env.')

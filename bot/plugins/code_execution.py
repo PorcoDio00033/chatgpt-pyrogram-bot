@@ -1,3 +1,6 @@
+# legacy plugin
+# disabled because security nightmare
+# imo the only way to run untrusted user code is within an external dagger socker or ephemeral vm not bound to host
 import hashlib
 import logging
 from typing import Dict, List

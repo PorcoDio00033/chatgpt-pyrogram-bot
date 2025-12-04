@@ -1,0 +1,2 @@
+{{ User }} has attached the following document.
+Wait for the next message to process it. {{ User }} will likely give you instructions regarding the document.

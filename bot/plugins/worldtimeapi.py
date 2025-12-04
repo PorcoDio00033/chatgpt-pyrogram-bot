@@ -1,15 +1,14 @@
 import os
 from datetime import datetime
 from typing import Dict, List
-
-import httpx
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .plugin import Plugin
 
 
 class WorldTimeApiPlugin(Plugin):
     """
-    A plugin to get the current time from a given timezone, using WorldTimeAPI
+    A plugin to get the current time from a given timezone, using local system data.
     """
 
     def __init__(self):
@@ -19,7 +18,7 @@ class WorldTimeApiPlugin(Plugin):
         self.default_timezone = default_timezone
 
     def get_source_name(self) -> str:
-        return 'WorldTimeAPI'
+        return 'LocalZoneInfo'
 
     def get_spec(self) -> List[Dict]:
         return [
@@ -27,7 +26,7 @@ class WorldTimeApiPlugin(Plugin):
                 'type': 'function',
                 'function': {
                     'name': 'worldtimeapi',
-                    'description': 'Get the current time from a given timezone',
+                    'description': 'Get the current time and date from a given timezone',
                     'parameters': {
                         'type': 'object',
                         'properties': {
@@ -46,17 +45,18 @@ class WorldTimeApiPlugin(Plugin):
         ]
 
     async def execute(self, function_name, helper, **kwargs) -> Dict:
-        timezone = kwargs.get('timezone', self.default_timezone)
-        url = f'https://worldtimeapi.org/api/timezone/{timezone}'
+        timezone_str = kwargs.get('timezone', self.default_timezone)
+        
+        try:
+            tz = ZoneInfo(timezone_str)
+        except ZoneInfoNotFoundError:
+            return {'error': f"Timezone '{timezone_str}' not found."}
 
-        async with httpx.AsyncClient() as client:
-            response = await client.get(url)
-
-        response.raise_for_status()
-        wtr = response.json().get('datetime')
-
-        wtr_obj = datetime.strptime(wtr, '%Y-%m-%dT%H:%M:%S.%f%z')
+        # Get current time in that timezone
+        wtr_obj = datetime.now(tz)
+        
         time_24hr = wtr_obj.strftime('%H:%M:%S')
         time_12hr = wtr_obj.strftime('%I:%M:%S %p')
+        date_str = wtr_obj.strftime('%Y-%m-%d')
 
-        return {'24hr': time_24hr, '12hr': time_12hr}
+        return {'24hr': time_24hr, '12hr': time_12hr, 'date': date_str, 'timezone': timezone_str}

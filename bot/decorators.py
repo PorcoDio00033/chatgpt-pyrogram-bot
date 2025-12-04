@@ -1,8 +1,7 @@
 import functools
-from typing import Callable, TypeVar
+from typing import Callable, TypeVar, Union
 
-from telegram import Update
-from telegram.ext import ContextTypes
+from pyrogram import Client, types
 
 T = TypeVar('T')
 
@@ -14,9 +13,9 @@ def with_conversation_lock(method: Callable[..., T]) -> Callable[..., T]:
     """
 
     @functools.wraps(method)
-    async def wrapper(self, update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+    async def wrapper(self, client: Client, update: Union[types.Message, types.CallbackQuery, types.Update], *args, **kwargs):
         ai_context_id = self.get_thread_id(update)
         async with self.openai.get_conversation_lock(ai_context_id):
-            return await method(self, update, context, *args, **kwargs)
+            return await method(self, client, update, *args, **kwargs)
 
     return wrapper

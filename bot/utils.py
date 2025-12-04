@@ -4,46 +4,48 @@ import asyncio
 import base64
 import itertools
 import json
-import logging
-from typing import Callable, Optional
+from typing import Callable, Optional, Union
 
-import telegram
-from telegram import ChatMember, Message, MessageEntity, Update, constants
-from telegram.ext import CallbackContext, ContextTypes
-from telegram.helpers import escape_markdown
+from pyrogram import Client, enums, types
+from pyrogram.errors import BadRequest, MessageNotModified
 from usage_tracker import UsageTracker
 
+from chill_logging import get_logger_instance
 
-def message_text(message: Message) -> str:
+logger = get_logger_instance("utils").logger
+
+
+def message_text(message: types.Message) -> str:
     """
     Returns the text of a message, excluding any bot commands.
     """
-    message_txt = message.text_markdown_v2
-    if not message_txt:
-        return ''
+    text = message.text or message.caption or ""
+    if not text:
+        return ""
 
-    for _, text in sorted(
-        message.parse_entities([MessageEntity.BOT_COMMAND]).items(),
-        key=(lambda item: item[0].offset),
-    ):
-        message_txt = message_txt.replace(escape_markdown(text, version=2), '').strip()
+    entities = message.entities or message.caption_entities or []
+    
+    # Sort entities by offset in descending order to remove them without affecting other offsets
+    for entity in sorted(entities, key=lambda x: x.offset, reverse=True):
+        if entity.type == enums.MessageEntityType.BOT_COMMAND:
+            text = text[:entity.offset] + text[entity.offset + entity.length:]
 
-    return message_txt.strip()
+    return text.strip()
 
 
-async def is_user_in_group(update: Update, context: CallbackContext, user_id: int) -> bool:
+async def is_user_in_group(client: Client, chat_id: int, user_id: int) -> bool:
     """
     Checks if user_id is a member of the group
     """
     try:
-        chat_member = await context.bot.get_chat_member(update.message.chat_id, user_id)
+        chat_member = await client.get_chat_member(chat_id, user_id)
         return chat_member.status in [
-            ChatMember.OWNER,
-            ChatMember.ADMINISTRATOR,
-            ChatMember.MEMBER,
+            enums.ChatMemberStatus.OWNER,
+            enums.ChatMemberStatus.ADMINISTRATOR,
+            enums.ChatMemberStatus.MEMBER,
         ]
-    except telegram.error.BadRequest as e:
-        if str(e) == 'User not found':
+    except BadRequest as e:
+        if 'User not found' in str(e):
             return False
         else:
             raise e
@@ -51,16 +53,17 @@ async def is_user_in_group(update: Update, context: CallbackContext, user_id: in
         raise e
 
 
-def get_forum_thread_id(update: Update) -> int | None:
+def get_forum_thread_id(message: Union[types.Message, types.Update]) -> int | None:
     """
     Gets the message thread id for the update, if any
     """
-    if update.effective_message and update.effective_message.is_topic_message:
-        return update.effective_message.message_thread_id
+    if isinstance(message, types.Message):
+        return message.message_thread_id
+
     return None
 
 
-def get_stream_cutoff_values(update: Update, content: str) -> int:
+def get_stream_cutoff_values(update: types.Message, content: str) -> int:
     """
     Gets the stream cutoff values for the message length
     """
@@ -70,25 +73,25 @@ def get_stream_cutoff_values(update: Update, content: str) -> int:
     return 90 if len(content) > 1000 else 45 if len(content) > 200 else 25 if len(content) > 50 else 15
 
 
-def is_group_chat(update: Update) -> bool:
+def is_group_chat(message: types.Message) -> bool:
     """
     Checks if the message was sent from a group chat
     """
-    if not update.effective_chat:
+    if not hasattr(message, 'chat') or not message.chat:
         return False
-    return update.effective_chat.type in [
-        constants.ChatType.GROUP,
-        constants.ChatType.SUPERGROUP,
+    return message.chat.type in [
+        enums.ChatType.GROUP,
+        enums.ChatType.SUPERGROUP,
     ]
 
 
-def is_private_chat(update: Update) -> bool:
+def is_private_chat(message: types.Message) -> bool:
     """
     Checks if the message was sent from a private chat
     """
-    if not update.effective_chat:
+    if not message.chat:
         return False
-    return update.effective_chat.type == constants.ChatType.PRIVATE
+    return message.chat.type == enums.ChatType.PRIVATE
 
 
 def split_into_chunks(text: str, chunk_size: int = 4096) -> list[str]:
@@ -99,31 +102,42 @@ def split_into_chunks(text: str, chunk_size: int = 4096) -> list[str]:
 
 
 async def wrap_with_indicator(
-    update: Update,
-    context: CallbackContext,
+    client: Client,
+    message: types.Message,
     coroutine,
-    chat_action: constants.ChatAction = '',
+    chat_action: enums.ChatAction = enums.ChatAction.TYPING,
     is_inline=False,
 ):
     """
     Wraps a coroutine while repeatedly sending a chat action to the user.
     """
-    task = context.application.create_task(coroutine(), update=update)
+    # Create the task for the coroutine
+    task = asyncio.create_task(coroutine())
+    
     while not task.done():
         if not is_inline:
-            context.application.create_task(
-                update.effective_chat.send_action(chat_action, message_thread_id=get_forum_thread_id(update))
-            )
+            try:
+                await client.send_chat_action(
+                    chat_id=message.chat.id,
+                    action=chat_action,
+                    message_thread_id=get_forum_thread_id(message)
+                )
+            except Exception:
+                # Ignore errors sending chat action (e.g. if bot was kicked)
+                pass
+                
         try:
             await asyncio.wait_for(asyncio.shield(task), 4.5)
         except asyncio.TimeoutError:
             pass
+    
+    return await task
 
 
 async def edit_message_with_retry(
-    context: ContextTypes.DEFAULT_TYPE,
+    client: Client,
     chat_id: int | None,
-    message_id: str,
+    message_id: int,
     text: str,
     markdown: bool = True,
     is_inline: bool = False,
@@ -139,65 +153,79 @@ async def edit_message_with_retry(
     :return: None
     """
     try:
-        await context.bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=int(message_id) if not is_inline else None,
-            inline_message_id=message_id if is_inline else None,
-            text=text,
-            parse_mode=constants.ParseMode.HTML if markdown else None,
-            disable_web_page_preview=True,
-        )
-    except telegram.error.BadRequest as e:
-        if str(e).startswith('Message is not modified'):
-            return
+        kwargs = {
+            "text": text,
+            "parse_mode": enums.ParseMode.DEFAULT, # pyrogram DEFAULT=markdown+html
+            #"parse_mode": enums.ParseMode.HTML if markdown else enums.ParseMode.DEFAULT,
+            "link_preview_options": types.LinkPreviewOptions(is_disabled=True),
+        }
+        if is_inline:
+            await client.edit_inline_text(inline_message_id=str(message_id), **kwargs)
+        else:
+            await client.edit_message_text(chat_id=chat_id, message_id=message_id, **kwargs)
+    except MessageNotModified:
+        return
+    except BadRequest as e:
+        # Fallback to plain text if markdown fails
         try:
-            await context.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=int(message_id) if not is_inline else None,
-                inline_message_id=message_id if is_inline else None,
-                text=text,
-            )
+            kwargs["parse_mode"] = None
+            if is_inline:
+                await client.edit_inline_text(inline_message_id=str(message_id), **kwargs)
+            else:
+                await client.edit_message_text(chat_id=chat_id, message_id=message_id, **kwargs)
         except Exception as e:
-            logging.warning(f'Failed to edit message: {str(e)}')
+            logger.warning(f'Failed to edit message: {str(e)}')
             raise e
-
     except Exception as e:
-        logging.warning(str(e))
+        logger.warning(str(e))
         raise e
 
 
-async def error_handler(_: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def error_handler(client: Client, update: types.Update, error: Exception) -> None:
     """
-    Handles errors in the telegram-python-bot library.
+    Handles errors.
     """
-    logging.error(f'Exception while handling an update: {context.error}', exc_info=context.error)
+    logger.error(f'Exception while handling an update: {error}', exc_info=error)
 
 
-async def is_allowed(config, update: Update, context: CallbackContext, is_inline=False) -> bool:
+async def is_allowed(config, client: Client, update: Union[types.Message, types.InlineQuery], is_inline=False) -> bool:
     """
     Checks if the user is allowed to use the bot.
     """
     if config['allowed_user_ids'] == '*':
         return True
 
-    user_id = update.inline_query.from_user.id if is_inline else update.message.from_user.id
+    user = update.from_user
+    if not user:
+        return False
+        
+    user_id = user.id
     if is_admin(config, user_id):
         return True
-    name = update.inline_query.from_user.name if is_inline else update.message.from_user.name
+        
+    name = extract_username(user)
     allowed_user_ids = config['allowed_user_ids'].split(',')
+    
     # Check if user is allowed
     if str(user_id) in allowed_user_ids:
         return True
-    # Check if it's a group a chat with at least one authorized member
-    if not is_inline and is_group_chat(update):
+        
+    # Check if it's a group chat with at least one authorized member
+    # Note: update is usually Message here if not inline
+    if not is_inline and isinstance(update, types.Message) and is_group_chat(update):
         admin_user_ids = config['admin_user_ids'].split(',')
-        for user in itertools.chain(allowed_user_ids, admin_user_ids):
-            if not user.strip():
+        for allowed_user in itertools.chain(allowed_user_ids, admin_user_ids):
+            if not allowed_user.strip():
                 continue
-            if await is_user_in_group(update, context, user):
-                logging.info(f'{user} is a member. Allowing group chat message...')
-                return True
-        logging.info(f'Group chat messages from user {name} (id: {user_id}) are not allowed')
+            try:
+                # Check if the allowed user is in this group
+                if await is_user_in_group(client, update.chat.id, int(allowed_user)):
+                    logger.info(f'{allowed_user} is a member. Allowing group chat message...')
+                    return True
+            except ValueError:
+                continue
+                
+        logger.info(f'Group chat messages from user {name} (id: {user_id}) are not allowed')
     return False
 
 
@@ -208,7 +236,7 @@ def is_admin(config, user_id: int, log_no_admin=False) -> bool:
     """
     if config['admin_user_ids'] == '-':
         if log_no_admin:
-            logging.info('No admin user defined.')
+            logger.info('No admin user defined.')
         return False
 
     admin_user_ids = config['admin_user_ids'].split(',')
@@ -247,7 +275,7 @@ def get_user_budget(config, user_id) -> float | None:
     if config['allowed_user_ids'] == '*':
         # same budget for all users, use value in first position of budget list
         if len(user_budgets) > 1:
-            logging.warning(
+            logger.warning(
                 'multiple values for budgets set with unrestricted user list '
                 'only the first value is used as budget for everyone.'
             )
@@ -257,13 +285,13 @@ def get_user_budget(config, user_id) -> float | None:
     if str(user_id) in allowed_user_ids:
         user_index = allowed_user_ids.index(str(user_id))
         if len(user_budgets) <= user_index:
-            logging.warning(f'No budget set for user id: {user_id}. Budget list shorter than user list.')
+            logger.warning(f'No budget set for user id: {user_id}. Budget list shorter than user list.')
             return 0.0
         return float(user_budgets[user_index])
     return None
 
 
-def get_remaining_budget(config, usage, update: Update, is_inline=False) -> float:
+def get_remaining_budget(config, usage, update: Union[types.Message, types.InlineQuery], is_inline=False) -> float:
     """
     Calculate the remaining budget for a user based on their current usage.
     :param config: The bot configuration object
@@ -279,8 +307,10 @@ def get_remaining_budget(config, usage, update: Update, is_inline=False) -> floa
         'all-time': 'cost_all_time',
     }
 
-    user_id = update.inline_query.from_user.id if is_inline else update.message.from_user.id
-    name = update.inline_query.from_user.name if is_inline else update.message.from_user.name
+    user = update.from_user
+    user_id = user.id
+    name = extract_username(user)
+    
     if user_id not in usage:
         usage[user_id] = UsageTracker(user_id, name)
 
@@ -298,7 +328,7 @@ def get_remaining_budget(config, usage, update: Update, is_inline=False) -> floa
     return config['guest_budget'] - cost
 
 
-def is_within_budget(config, usage, update: Update, is_inline=False) -> bool:
+def is_within_budget(config, usage, update: Union[types.Message, types.InlineQuery], is_inline=False) -> bool:
     """
     Checks if the user reached their usage limit.
     Initializes UsageTracker for user and guest when needed.
@@ -308,8 +338,10 @@ def is_within_budget(config, usage, update: Update, is_inline=False) -> bool:
     :param is_inline: Boolean flag for inline queries
     :return: Boolean indicating if the user has a positive budget
     """
-    user_id = update.inline_query.from_user.id if is_inline else update.message.from_user.id
-    name = update.inline_query.from_user.name if is_inline else update.message.from_user.name
+    user = update.from_user
+    user_id = user.id
+    name = extract_username(user)
+    
     if user_id not in usage:
         usage[user_id] = UsageTracker(user_id, name)
     remaining_budget = get_remaining_budget(config, usage, update, is_inline=is_inline)
@@ -326,7 +358,7 @@ def add_chat_request_to_usage_tracker(usage, config, user_id, used_tokens):
     """
     try:
         if int(used_tokens) == 0:
-            logging.warning('No tokens used. Not adding chat request to usage tracker.')
+            logger.warning('No tokens used. Not adding chat request to usage tracker.')
             return
         # add chat request to users usage tracker
         usage[user_id].add_chat_tokens(used_tokens, config['token_price'])
@@ -335,19 +367,31 @@ def add_chat_request_to_usage_tracker(usage, config, user_id, used_tokens):
         if str(user_id) not in allowed_user_ids and 'guests' in usage:
             usage['guests'].add_chat_tokens(used_tokens, config['token_price'])
     except Exception as e:
-        logging.warning(f'Failed to add tokens to usage_logs: {str(e)}')
+        logger.warning(f'Failed to add tokens to usage_logs: {str(e)}')
         pass
 
 
-def get_reply_to_message_id(config, update: Update):
-    """
-    Returns the message id of the message to reply to
-    :param config: Bot configuration object
-    :param update: Telegram update object
-    :return: Message id of the message to reply to, or None if quoting is disabled
-    """
-    if config['enable_quoting'] or is_group_chat(update):
-        return update.message.message_id
+# def get_reply_to_message_id(config, message: types.Message):
+#     """
+#     Returns the message id of the message to reply to
+#     :param config: Bot configuration object
+#     :param update: Telegram update object
+#     :return: Message id of the message to reply to, or None if quoting is disabled
+#     """
+#     if config['enable_quoting'] or is_group_chat(message):
+#         return message.id
+#     return None
+
+# pyrotgfork requires types.ReplyParameters() obj for quoting
+def is_quoting_enabled(config, message: types.Message):
+    if config['enable_quoting'] or is_group_chat(message):
+        return types.ReplyParameters(message_id=message.id)
+    return None
+
+# similar to user.name of PTB
+def extract_username(user: types.User):
+    if isinstance(user, types.User):
+        return user.first_name if not user.username else f"@{user.username}"
     return None
 
 
@@ -371,7 +415,7 @@ def is_direct_result(response: any) -> bool:
         return response.get('direct_result', False)
 
 
-async def handle_direct_result(config, update: Update, response: any, save_reply: Optional[Callable] = None):
+async def handle_direct_result(config, update: types.Message, response: any, save_reply: Optional[Callable] = None):
     if isinstance(response, list):
         for resp in response[:10]:  # limit to first 10 direct results to avoid flooding
             await __handle_direct_result(config, update, resp, save_reply)
@@ -379,7 +423,7 @@ async def handle_direct_result(config, update: Update, response: any, save_reply
         await __handle_direct_result(config, update, response, save_reply)
 
 
-async def __handle_direct_result(config, update: Update, response: any, save_reply: Optional[Callable] = None):
+async def __handle_direct_result(config, message: types.Message, response: any, save_reply: Optional[Callable] = None):
     """
     Handles a direct result from a plugin
     """
@@ -390,79 +434,79 @@ async def __handle_direct_result(config, update: Update, response: any, save_rep
     kind = result['kind']
 
     common_args = {
-        'message_thread_id': get_forum_thread_id(update),
-        'reply_to_message_id': get_reply_to_message_id(config, update),
+        # pyrotgfork reply_* auto handles message_thread_id
+        #'message_thread_id': get_forum_thread_id(message),
+        'reply_parameters': is_quoting_enabled(config, message),
     }
 
     sent_msg = None
     if kind == 'photo':
-        sent_msg = await update.effective_message.reply_photo(
-            **common_args, photo=result['photo'], caption=result.get('caption')
+        sent_msg = await message.reply_photo(
+            photo=result['photo'], caption=result.get('caption'), **common_args
         )
     elif kind == 'album':
-        media = [telegram.InputMediaPhoto(media=photo) for photo in result['photos']]
+        media = [types.InputMediaPhoto(media=photo) for photo in result['photos']]
         if 'caption' in result:
-            media[0] = telegram.InputMediaPhoto(media=result['photos'][0], caption=result['caption'])
+            media[0] = types.InputMediaPhoto(media=result['photos'][0], caption=result['caption'])
 
-        sent_msgs = await update.effective_message.reply_media_group(**common_args, media=media)
+        sent_msgs = await message.reply_media_group(media=media, **common_args)
         sent_msg = sent_msgs[-1] if sent_msgs else None
     elif kind in {'gif', 'file', 'document'}:
-        sent_msg = await update.effective_message.reply_document(
-            **common_args, document=result['document'], caption=result.get('caption')
+        sent_msg = await message.reply_document(
+            document=result['document'], caption=result.get('caption'), **common_args
         )
     elif kind == 'reaction':
-        await update.effective_message.set_reaction(reaction=result['reaction'])
+        await message._client.set_reaction(chat_id=message.chat.id, message_id=message.id, reaction=result['reaction'])
     elif kind == 'voice':
-        sent_msg = await update.effective_message.reply_voice(
-            **common_args, voice=result['voice'], caption=result.get('caption')
+        sent_msg = await message.reply_voice(
+            voice=result['voice'], caption=result.get('caption'), **common_args
         )
     elif kind == 'video_note':
-        sent_msg = await update.effective_message.reply_video_note(
-            **common_args,
-            video_note=result['video_note'],
+        sent_msg = await message.reply_video_note(
+            video_note=result['video_note'], **common_args
         )
     elif kind == 'video':
-        sent_msg = await update.effective_message.reply_video(
-            **common_args, video=result['video'], caption=result.get('caption')
+        sent_msg = await message.reply_video(
+            video=result['video'], caption=result.get('caption'), **common_args
         )
     elif kind == 'audio':
-        sent_msg = await update.effective_message.reply_audio(
-            **common_args, audio=result['audio'], caption=result.get('caption')
+        sent_msg = await message.reply_audio(
+            audio=result['audio'], caption=result.get('caption'), **common_args
         )
     elif kind == 'dice':
-        sent_msg = await update.effective_message.reply_dice(**common_args, emoji=result['emoji'])
+        sent_msg = await message._client.send_dice(chat_id=message.chat.id, emoji=result['emoji'], **common_args)
     elif kind == 'poll':
-        sent_msg = await update.effective_message.reply_poll(
-            **common_args,
+        sent_msg = await message.reply_poll(
             question=result['question'],
             options=result['options'],
             is_anonymous=result.get('is_anonymous', False),
             allows_multiple_answers=result.get('allows_multiple_answers', False),
+            **common_args
         )
     elif kind == 'location':
-        sent_msg = await update.effective_message.reply_location(
-            **common_args,
+        sent_msg = await message.reply_location(
             latitude=result['latitude'],
             longitude=result['longitude'],
+            **common_args
         )
     elif kind == 'venue':
-        sent_msg = await update.effective_message.reply_venue(
-            **common_args,
+        sent_msg = await message.reply_venue(
             latitude=result['latitude'],
             longitude=result['longitude'],
             title=result['title'],
             address=result['address'],
+            **common_args
         )
     elif kind == 'contact':
-        sent_msg = await update.effective_message.reply_contact(
-            **common_args,
+        sent_msg = await message.reply_contact(
             phone_number=result['phone_number'],
             first_name=result['first_name'],
             last_name=result['last_name'],
+            **common_args
         )
 
     if save_reply and sent_msg:
-        save_reply(sent_msg, update)
+        save_reply(sent_msg, message)
 
 
 # Function to encode the image
@@ -474,3 +518,5 @@ def encode_image(fileobj):
 def decode_image(imgbase64):
     image = imgbase64[len('data:image/jpeg;base64,') :]
     return base64.b64decode(image)
+
+

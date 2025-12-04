@@ -1,18 +1,53 @@
-FROM python:3.14-alpine
+# build phase
+FROM python:3.14-slim as builder
 
-ENV PYTHONFAULTHANDLER=1 \
-     PYTHONUNBUFFERED=1 \
-     PYTHONDONTWRITEBYTECODE=1 \
-     PIP_DISABLE_PIP_VERSION_CHECK=on
+ENV POETRY_NO_INTERACTION=1 \
+    POETRY_VIRTUALENVS_IN_PROJECT=1 \
+    POETRY_VIRTUALENVS_CREATE=1 \
+    PIP_DEFAULT_TIMEOUT=100
 
-# Install ffmpeg, Docker CLI and dependencies
-RUN apk --no-cache add ffmpeg docker curl gcc musl-dev libffi-dev openssl-dev python3-dev build-base
+RUN apt-get update && apt-get install -y \
+    gcc \
+    g++ \
+    libffi-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# should be fine with pip in builder, actually i'm not too sure lol
+RUN pip install "poetry>=2.0.0,<3.0.0"
 
 WORKDIR /app
-COPY . .
-RUN pip install -r requirements.txt --no-cache-dir
 
-# Create a dagger directory for cache
-RUN mkdir -p /root/.dagger
+COPY pyproject.toml poetry.lock ./
+
+RUN poetry install --no-root --only main
+
+
+# run phase
+FROM python:3.14-slim as runtime
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PATH="/app/.venv/bin:$PATH"
+
+WORKDIR /app
+
+# ffmpeg: required for audio processing
+# cairo: required for converting tsg (animated telegram stickers) to mp4
+RUN apt-get update && apt-get install -y \
+    ffmpeg \
+    curl \
+    gnupg \
+    libcairo2 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd -m -u 1000 appuser
+
+COPY --from=builder /app/.venv ./.venv
+
+COPY . .
+
+RUN mkdir -p /app/data && chown -R appuser:appuser /app/data
+
+USER appuser
 
 CMD ["python", "bot/main.py"]

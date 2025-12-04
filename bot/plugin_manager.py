@@ -1,9 +1,8 @@
 import json
-import logging
 from typing import TYPE_CHECKING, Dict
 
+from chill_logging import get_logger_instance
 from plugins.auto_tts import AutoTextToSpeech
-from plugins.code_execution import CodeExecutionPlugin
 from plugins.ddg_image_search import DDGImageSearchPlugin
 from plugins.dux_distributed_global_search import DDGSPlugin
 from plugins.gtts_text_to_speech import GTTSTextToSpeech
@@ -24,7 +23,9 @@ class PluginManager:
     A class to manage the plugins and call the correct functions
     """
 
-    def __init__(self, config):
+    def __init__(self, config, strict_tools: bool = True):
+        self.logger = get_logger_instance("plugin_manager").logger
+        self.strict_tools = strict_tools
         plugin_mapping = {
             'telegram': TelegramToolkitPlugin,
             'wolfram': WolframAlphaPlugin,
@@ -44,7 +45,6 @@ class PluginManager:
             # 'iplocation': IpLocationPlugin,
             'website_content': WebsiteContentPlugin,
             # 'youtube_transcript': YoutubeTranscriptPlugin,
-            'code': CodeExecutionPlugin,
             'thinking': SequentialThinkingPlugin,
         }
 
@@ -58,7 +58,15 @@ class PluginManager:
         """
         Return the list of function specs that can be called by the model
         """
-        return [spec for specs in map(lambda plugin: plugin.get_spec(), self.plugins) for spec in specs]
+        specs = [spec for specs in map(lambda plugin: plugin.get_spec(), self.plugins) for spec in specs]
+        # not all custom non-openai model support 'strict' function flag
+        if not self.strict_tools:
+            for spec in specs:
+                if spec.get('strict'):
+                    del spec['strict']
+                if spec.get('function', {}).get('strict'):
+                    del spec['function']['strict']
+        return specs
 
     @retry(
         reraise=True,
@@ -70,7 +78,7 @@ class PluginManager:
         try:
             return await self.__call_function(chat_id, function_name, helper, arguments)
         except Exception as e:
-            logging.error(f'Error calling function {function_name}:', exc_info=e)
+            self.logger.error(f'Error calling function {function_name}:', exc_info=e)
             return {'error': f'Error calling function {function_name}'}
 
     async def __call_function(self, chat_id: str, function_name: str, helper: 'OpenAIHelper', arguments: str) -> Dict:
@@ -82,7 +90,7 @@ class PluginManager:
             return {'error': f'Function {function_name} not found'}
 
         if not getattr(plugin, '_bootstrap', True):
-            logging.info(f'Bootstrapping plugin {plugin.get_source_name()}')
+            self.logger.info(f'Bootstrapping plugin {plugin.get_source_name()}')
             await plugin.bootstrap()
 
         return await plugin.execute(function_name, helper, **json.loads(arguments), chat_id=chat_id)

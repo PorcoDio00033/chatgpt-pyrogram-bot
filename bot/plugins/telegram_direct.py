@@ -1,8 +1,82 @@
 from typing import Dict, List
 
-from telegram.constants import ReactionEmoji
-
 from .plugin import Plugin
+
+# pyrogram doesn't have a obj listing all reactions
+class ReactionEmoji:
+    THUMBS_UP = "👍"
+    THUMBS_DOWN = "👎"
+    RED_HEART = "❤"
+    FIRE = "🔥"
+    SMILING_FACE_WITH_HEARTS = "🥰"
+    CLAPPING_HANDS = "👏"
+    GRINNING_FACE_WITH_SMILING_EYES = "😁"
+    THINKING_FACE = "🤔"
+    SHOCKED_FACE_WITH_EXPLODING_HEAD = "🤯"        
+    FACE_SCREAMING_IN_FEAR = "😱"
+    SERIOUS_FACE_WITH_SYMBOLS_COVERING_MOUTH = "🤬"
+    CRYING_FACE = "😢"
+    PARTY_POPPER = "🎉"
+    GRINNING_FACE_WITH_STAR_EYES = "🤩"
+    FACE_WITH_OPEN_MOUTH_VOMITING = "🤮"
+    PILE_OF_POO = "💩"
+    PERSON_WITH_FOLDED_HANDS = "🙏"
+    OK_HAND_SIGN = "👌"
+    DOVE_OF_PEACE = "🕊"
+    CLOWN_FACE = "🤡"
+    YAWNING_FACE = "🥱"
+    FACE_WITH_UNEVEN_EYES_AND_WAVY_MOUTH = "🥴"
+    SMILING_FACE_WITH_HEART_SHAPED_EYES = "😍"
+    SPOUTING_WHALE = "🐳"
+    HEART_ON_FIRE = "❤️‍🔥"
+    NEW_MOON_WITH_FACE = "🌚"
+    HOT_DOG = "🌭"
+    HUNDRED_POINTS_SYMBOL = "💯"
+    ROLLING_ON_THE_FLOOR_LAUGHING = "🤣"
+    HIGH_VOLTAGE_SIGN = "⚡"
+    BANANA = "🍌"
+    TROPHY = "🏆"
+    BROKEN_HEART = "💔"
+    FACE_WITH_ONE_EYEBROW_RAISED = "🤨"
+    NEUTRAL_FACE = "😐"
+    STRAWBERRY = "🍓"
+    BOTTLE_WITH_POPPING_CORK = "🍾"
+    KISS_MARK = "💋"
+    REVERSED_HAND_WITH_MIDDLE_FINGER_EXTENDED = "🖕"
+    SMILING_FACE_WITH_HORNS = "😈"
+    SLEEPING_FACE = "😴"
+    LOUDLY_CRYING_FACE = "😭"
+    NERD_FACE = "🤓"
+    GHOST = "👻"
+    MAN_TECHNOLOGIST = "👨‍💻"
+    EYES = "👀"
+    JACK_O_LANTERN = "🎃"
+    SEE_NO_EVIL_MONKEY = "🙈"
+    SMILING_FACE_WITH_HALO = "😇"
+    FEARFUL_FACE = "😨"
+    HANDSHAKE = "🤝"
+    WRITING_HAND = "✍"
+    HUGGING_FACE = "🤗"
+    SALUTING_FACE = "🫡"
+    FATHER_CHRISTMAS = "🎅"
+    CHRISTMAS_TREE = "🎄"
+    SNOWMAN = "☃"
+    NAIL_POLISH = "💅"
+    GRINNING_FACE_WITH_ONE_LARGE_AND_ONE_SMALL_EYE = "🤪"
+    MOYAI = "🗿"
+    SQUARED_COOL = "🆒"
+    HEART_WITH_ARROW = "💘"
+    HEAR_NO_EVIL_MONKEY = "🙉"
+    UNICORN_FACE = "🦄"
+    FACE_THROWING_A_KISS = "😘"
+    PILL = "💊"
+    SPEAK_NO_EVIL_MONKEY = "🙊"
+    SMILING_FACE_WITH_SUNGLASSES = "😎"
+    ALIEN_MONSTER = "👾"
+    MAN_SHRUGGING = "🤷‍♂️"
+    SHRUG = "🤷"
+    WOMAN_SHRUGGING = "🤷‍♀️"
+    POUTING_FACE = "😡"
 
 
 class TelegramToolkitPlugin(Plugin):
@@ -10,7 +84,11 @@ class TelegramToolkitPlugin(Plugin):
     A plugin providing direct access to Telegram API features
     """
 
-    _emojis = [emoji.value for emoji in ReactionEmoji]
+    _emojis = [
+        value
+        for key, value in ReactionEmoji.__dict__.items()
+        if not key.startswith("__") and isinstance(value, str)
+    ]
     _emojis_set = set(_emojis)
 
     def get_source_name(self) -> str:

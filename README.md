@@ -1,18 +1,35 @@
-# ChatGPT Telegram Bot
-![python-version](https://img.shields.io/badge/python-3.9-blue.svg)
-[![openai-version](https://img.shields.io/badge/openai-0.27.8-orange.svg)](https://openai.com/)
-[![license](https://img.shields.io/badge/License-GPL%202.0-brightgreen.svg)](LICENSE)
-[![Publish Docker image](https://github.com/n3d1117/chatgpt-telegram-bot/actions/workflows/publish.yaml/badge.svg)](https://github.com/n3d1117/chatgpt-telegram-bot/actions/workflows/publish.yaml)
+# ChatGPT Pyrogram Bot (Pyrotgfork)
 
-A [Telegram bot](https://core.telegram.org/bots/api) that integrates with OpenAI's _official_ [ChatGPT](https://openai.com/blog/chatgpt/), [DALL·E](https://openai.com/product/dall-e-2) and [Whisper](https://openai.com/research/whisper) APIs to provide answers. Ready to use with minimal configuration required.
+![python-version](https://img.shields.io/badge/python-3.12%2B-blue.svg)
+[![license](https://img.shields.io/badge/License-GPL%202.0-brightgreen.svg)](LICENSE)
+
+A [Telegram bot](https://core.telegram.org/bots/api) that integrates with OpenAI's _official_ [ChatGPT](https://openai.com/blog/chatgpt/), [DALL·E](https://openai.com/product/dall-e-2) and [Whisper](https://openai.com/research/whisper) APIs to provide answers.
+
+**This is a fork of the original project, migrated to [Pytgfork](https://github.com/TelegramPlayGround/pyrogram) and [Poetry](https://python-poetry.org/).**
+
+## Fork Features & Changelog
+
+This fork introduces several significant changes and improvements:
+
+*   **Core Migration**: The bot has been migrated from `python-telegram-bot` to **Pyrotgfork**, offering better performance and async capabilities.
+*   **Dependency Management**: Switched to **Poetry** for robust dependency management.
+*   **New Prompts**: Added specialized prompts for:
+    *   **PDF Handling**: Summarize and analyze attached PDF documents.
+    *   **Reactions**: Custom responses when users react to messages.
+    *   **Speech-to-Text (STT)**: Enhanced transcription prompts.
+*   **Configuration Updates**:
+    *   Updated Docker configuration and environment variables.
+    *   Added `text`, `image`, `audio`, `video`, `pdf` directly as configurable LLM inputs via `OPENAI_MODEL_SUPPORTED_INPUT`.
+    *   Introduced `chill_logging` for better logging and a centralized `config` module.
+    *   Updated `worldtimeapi` plugin to use `LocalZoneInfo`.
+*   **Functionality**:
+    *   Moved STT logic to a dedicated `/stt` command.
+    *   Disabled the `code_execution` plugin for security reasons.
 
 ## Screenshots
 
 ### Demo
 ![demo](https://user-images.githubusercontent.com/11541888/225114786-0d639854-b3e1-4214-b49a-e51ce8c40387.png)
-
-### Plugins
-![plugins](https://github.com/n3d1117/chatgpt-telegram-bot/assets/11541888/83d5e0cd-e09a-463d-a292-722f919e929f)
 
 ## Features
 - [x] Support markdown in answers
@@ -27,7 +44,7 @@ A [Telegram bot](https://core.telegram.org/bots/api) that integrates with OpenAI
 - [x] Get personal token usage statistics via the `/stats` command - by [@AlexHTW](https://github.com/AlexHTW)
 - [x] User budgets and guest budgets - by [@AlexHTW](https://github.com/AlexHTW)
 - [x] Stream support
-- [x] GPT-4 support
+- [x] GPT-4 and newer models support
   - If you have access to the GPT-4 API, simply change the `OPENAI_MODEL` parameter to `gpt-4`
 - [x] Localized bot language
   - Available languages :brazil: :cn: :finland: :de: :indonesia: :iran: :it: :malaysia: :netherlands: :poland: :ru: :saudi_arabia: :es: :taiwan: :tr: :ukraine: :gb: :uzbekistan: :vietnam: :israel:
@@ -49,9 +66,11 @@ If you want to help with translations, check out the [Translations Manual](https
 PRs are always welcome!
 
 ## Prerequisites
-- Python 3.9+
+- Python 3.12+
+- [Poetry](https://python-poetry.org/docs/#installation)
 - A [Telegram bot](https://core.telegram.org/bots#6-botfather) and its token (see [tutorial](https://core.telegram.org/bots/tutorial#obtain-your-bot-token))
 - An [OpenAI](https://openai.com) account (see [configuration](#configuration) section)
+- **Telegram API ID and Hash** (Required for Pyrogram, [guide here](https://core.telegram.org/api/obtaining_api_id))
 
 ## Getting started
 
@@ -61,7 +80,9 @@ Customize the configuration by copying `.env.example` and renaming it to `.env`,
 | Parameter                   | Description                                                                                                                                                                                                                   |
 |-----------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `OPENAI_API_KEY`            | Your OpenAI API key, you can get it from [here](https://platform.openai.com/account/api-keys)                                                                                                                                 |
-| `TELEGRAM_BOT_TOKEN`        | Your Telegram bot's token, obtained using [BotFather](http://t.me/botfather) (see [tutorial](https://core.telegram.org/bots/tutorial#obtain-your-bot-token))                                                                  |
+| `TELEGRAM_BOT_TOKEN`        | Your Telegram bot's token, obtained using [BotFather](http://t.me/botfather)                                                                                                                                                  |
+| `TELEGRAM_API_ID`           | **(New)** Your Telegram API ID from [my.telegram.org](https://my.telegram.org/)                                                                                                                                               |
+| `TELEGRAM_API_HASH`         | **(New)** Your Telegram API Hash from [my.telegram.org](https://my.telegram.org/)                                                                                                                                             |
 | `ADMIN_USER_IDS`            | Telegram user IDs of admins. These users have access to special admin commands, information and no budget restrictions. Admin IDs don't have to be added to `ALLOWED_TELEGRAM_USER_IDS`. **Note**: by default, no admin (`-`) |
 | `ALLOWED_TELEGRAM_USER_IDS` | A comma-separated list of Telegram user IDs that are allowed to interact with the bot (use [getidsbot](https://t.me/getidsbot) to find your user ID). **Note**: by default, *everyone* is allowed (`*`)                       |
 
@@ -101,7 +122,8 @@ Check out the [Budget Manual](https://github.com/n3d1117/chatgpt-telegram-bot/di
 | `PROXY`                            | Proxy to be used for OpenAI and Telegram bot (e.g. `http://localhost:8080`)                                                                                                                                                                                                             | -                                  |
 | `OPENAI_PROXY`                     | Proxy to be used only for OpenAI (e.g. `http://localhost:8080`)                                                                                                                                                                                                                         | -                                  |
 | `TELEGRAM_PROXY`                   | Proxy to be used only for Telegram bot (e.g. `http://localhost:8080`)                                                                                                                                                                                                                   | -                                  |
-| `OPENAI_MODEL`                     | The OpenAI model to use for generating responses. You can find all available models [here](https://platform.openai.com/docs/models/)                                                                                                                                                    | `gpt-3.5-turbo`                    |
+| `OPENAI_MODEL`                     | The OpenAI model to use for generating responses. You can find all available models [here](https://platform.openai.com/docs/models/)                                                                                                                                                    | `gpt-4.1-mini`                     |
+| `OPENAI_MODEL_SUPPORTED_INPUT` | **(New)** Comma-separated list of supported inputs: `text`, `image`, `audio`, `video`, `pdf`.                                                                           | `text`                         |
 | `OPENAI_BASE_URL`                  | Endpoint URL for unofficial OpenAI-compatible APIs (e.g., LocalAI or text-generation-webui)                                                                                                                                                                                             | Default OpenAI API URL             |
 | `SHOW_USAGE`                       | Whether to show OpenAI token usage information after each response                                                                                                                                                                                                                      | `false`                            |
 | `STREAM`                           | Whether to stream responses. **Note**: incompatible, if enabled, with `N_CHOICES` higher than 1                                                                                                                                                                                         | `true`                             |
@@ -131,6 +153,10 @@ Check out the [Budget Manual](https://github.com/n3d1117/chatgpt-telegram-bot/di
 | `BOT_LANGUAGE`                     | Language of general bot messages. Currently available: `en`, `de`, `ru`, `tr`, `it`, `fi`, `es`, `id`, `nl`, `zh-cn`, `zh-tw`, `vi`, `fa`, `pt-br`, `uk`, `ms`, `uz`, `ar`.  [Contribute with additional translations](https://github.com/n3d1117/chatgpt-telegram-bot/discussions/219) | `en`                               |
 | `TTS_VOICE`                        | The Text to Speech voice to use. Allowed values: `alloy`, `echo`, `fable`, `onyx`, `nova`, or `shimmer`                                                                                                                                                                                 | `alloy`                            |
 | `TTS_MODEL`                        | The Text to Speech model to use. Allowed values: `tts-1` or `tts-1-hd`                                                                                                                                                                                                                  | `tts-1`                            |
+| `ASSISTANT_PROMPT_FILE`        | Path to a text file containing the assistant prompt.                                                                                                                    | `prompts/assistant_prompt.txt` |
+| `ATTACHED_PDF_PROMPT_FILE`     | **(New)** Path to the prompt used for summarizing attached PDFs.                                                                                                        | `prompts/attached_pdf_prompt.txt`|
+| `REACTION_PROMPT_FILE`         | **(New)** Path to the prompt used when a user reacts to a message.                                                                                                      | `prompts/reaction_prompt.txt`  |
+| `STT_USER_PROMPT_FILE`         | **(New)** Path to the prompt used for Speech-to-Text user context.                                                                                                      | `prompts/stt_user_prompt.txt`  |
 
 Check out the [official API reference](https://platform.openai.com/docs/api-reference/chat) for more details.
 
@@ -171,7 +197,6 @@ Check out the [official API reference](https://platform.openai.com/docs/api-refe
 | `WORLDTIME_DEFAULT_TIMEZONE`      | Default timezone to use, i.e. `Europe/Rome` (required only for the `worldtimeapi` plugin, you can get TZ Identifiers from [here](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones)) | -                                   |
 | `DDGS_SAFESEARCH`           | DDGS safe search (`on`, `off` or `moderate`) (optional, applies to `dux_distributed_global_search`)                                                                               | `moderate`                          |
 | `DEEPL_API_KEY`                   | DeepL API key (required for the `deepl` plugin, you can get one [here](https://www.deepl.com/pro-api?cta=header-pro-api))                                                                       | -                                   |
-
 ### Installing
 Clone the repository and navigate to the project directory:
 
@@ -180,62 +205,35 @@ git clone https://github.com/n3d1117/chatgpt-telegram-bot.git
 cd chatgpt-telegram-bot
 ```
 
-#### From Source
-1. Create a virtual environment:
-```shell
-python -m venv venv
-```
+#### From Source (using Poetry)
+1.  Install dependencies:
+    ```shell
+    poetry install
+    ```
 
-2. Activate the virtual environment:
-```shell
-# For Linux or macOS:
-source venv/bin/activate
-
-# For Windows:
-venv\Scripts\activate
-```
-
-3. Install the dependencies using `requirements.txt` file:
-```shell
-pip install -r requirements.txt
-```
-
-4. Use the following command to start the bot:
-```
-python bot/main.py
-```
+2.  Start the bot:
+    ```shell
+    poetry run python bot/main.py
+    ```
 
 #### Using Docker Compose
 
 Run the following command to build and run the Docker image:
+
+> Make sure HOST_PERSISTENT_PATH env var is set to a valid host path
 ```shell
-docker compose up
+docker compose up -d
 ```
 
-#### Ready-to-use Docker images
-You can also use the Docker image from [Docker Hub](https://hub.docker.com/r/n3d1117/chatgpt-telegram-bot):
-```shell
-docker pull n3d1117/chatgpt-telegram-bot:latest
-docker run -it --env-file .env n3d1117/chatgpt-telegram-bot
-```
+## References
+*   **Parent Fork**: [MarshalX/chatgpt-telegram-bot](https://github.com/MarshalX/chatgpt-telegram-bot)
+*   **Original Project**: [n3d1117/chatgpt-telegram-bot](https://github.com/n3d1117/chatgpt-telegram-bot)
 
-or using the [GitHub Container Registry](https://github.com/n3d1117/chatgpt-telegram-bot/pkgs/container/chatgpt-telegram-bot/):
-
-```shell
-docker pull ghcr.io/n3d1117/chatgpt-telegram-bot:latest
-docker run -it --env-file .env ghcr.io/n3d1117/chatgpt-telegram-bot
-```
-
-#### Docker manual build
-```shell
-docker build -t chatgpt-telegram-bot .
-docker run -it --env-file .env chatgpt-telegram-bot
-```
 
 ## Credits
 - [ChatGPT](https://chat.openai.com/chat) from [OpenAI](https://openai.com)
-- [python-telegram-bot](https://python-telegram-bot.org)
-- [jiaaro/pydub](https://github.com/jiaaro/pydub)
+- [Pyrotgfork](https://github.com/TelegramPlayground/pyrogram)
+- [Poetry](https://python-poetry.org/)
 
 ## Disclaimer
 This is a personal project and is not affiliated with OpenAI in any way.

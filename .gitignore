@@ -6,3 +6,6 @@ usage_logs
 embeddings_exp
 venv
 /.cache
+/data
+/bot/downloads
+*.session*
