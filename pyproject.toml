@@ -33,8 +33,8 @@ dependencies = [
     "pytgcrypto (>=1.2.11,<2.0.0)",
     "pysocks (>=1.7.1,<2.0.0)",
     "pyaes (>=1.6.1,<2.0.0)",
-    "uvloop (==0.19.0) ; sys_platform not in 'win32 cygwin cli'",
-    "winloop (>=0.1.0) ; sys_platform in 'win32 cygwin cli'",
+    "uvloop (==0.22.1) ; sys_platform not in 'win32 cygwin cli'",
+    "winloop (==0.4.0) ; sys_platform in 'win32 cygwin cli'",
     "audioop-lts (==0.2.2) ; python_version >= \"3.13\"",
     "lottie[video] (>=0.7.2,<0.8.0)"
 ]
