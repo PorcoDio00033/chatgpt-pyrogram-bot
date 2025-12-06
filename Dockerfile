@@ -13,7 +13,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # should be fine with pip in builder, actually i'm not too sure lol
-RUN pip install "poetry>=2.0.0,<3.0.0"
+RUN pip install "poetry==2.2.1"
 
 WORKDIR /app
 
@@ -40,7 +40,7 @@ RUN apt-get update && apt-get install -y \
     libcairo2 \
     && rm -rf /var/lib/apt/lists/*
 
-RUN useradd -m -u 1000 appuser
+RUN useradd -m -u 1000 -U appuser
 
 COPY --from=builder /app/.venv ./.venv
 

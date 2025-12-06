@@ -1104,7 +1104,6 @@ class ChatGPTTelegramBot:
                 self.logger.info('Vision coming from group chat with wrong keyword, ignoring...')
                 return
 
-        # In Pyrogram, we check message.photo or message.document
         target_msg = reply if reply else message
         image = target_msg.photo or target_msg.document
         
@@ -1519,15 +1518,6 @@ class ChatGPTTelegramBot:
         if message.reply_to_message and (message.reply_to_message.document or message.reply_to_message.photo):
             attachment = message.reply_to_message.document or message.reply_to_message.photo
             if isinstance(attachment, types.Document) and attachment.mime_type == 'application/pdf':
-                # Modify message to point to reply
-                # In Pyrogram we can't easily modify the update structure like PTB
-                # We'll just call handle_pdf with the reply message but we need to pass the prompt (caption)
-                # handle_pdf expects the message with the PDF.
-                # So we call handle_pdf with reply_to_message, but we need to inject the caption/text from current message
-                
-                # Let's modify the reply_to_message object temporarily?
-                # Or better, pass the prompt explicitly to handle_pdf?
-                # handle_pdf reads message.caption.
                 message.reply_to_message.caption = prompt
                 return await self.handle_pdf(client, message.reply_to_message)
 
