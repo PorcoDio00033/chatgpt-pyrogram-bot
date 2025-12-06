@@ -26,7 +26,7 @@ dependencies = [
     "youtube-transcript-api (==1.2.3)",
     "asyncpg (==0.30.0)",
     "google-api-python-client (==2.140.0)",
-    "pypdf (==5.5.0)",
+    "pypdf (==6.4.0)",
     "aiofiles (==25.1.0)",
     "tzdata (>=2025.2,<2026.0)",
     "pyrotgfork (>=2.2.16,<3.0.0)",
