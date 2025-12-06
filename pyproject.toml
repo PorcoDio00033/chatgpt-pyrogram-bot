@@ -30,7 +30,7 @@ dependencies = [
     "aiofiles (==25.1.0)",
     "tzdata (>=2025.2,<2026.0)",
     "pyrotgfork (>=2.2.16,<3.0.0)",
-    "pytgcrypto (>=1.2.11,<2.0.0)",
+    "pytgcrypto @ git+https://github.com/TelegramPlayground/pyrogram-tgcrypto.git@v1.2.11",
     "pysocks (>=1.7.1,<2.0.0)",
     "pyaes (>=1.6.1,<2.0.0)",
     "uvloop (==0.22.1) ; sys_platform not in 'win32 cygwin cli'",
