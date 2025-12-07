@@ -34,7 +34,7 @@ WORKDIR /app
 # ffmpeg: required for audio processing
 # cairo: required for converting tsg (animated telegram stickers) to mp4
 RUN apt-get update && apt-get install -y \
-    ffmpeg \
+    ffmpeg=7:7.1.3-0+deb13u1 \
     curl \
     gnupg \
     libcairo2 \
