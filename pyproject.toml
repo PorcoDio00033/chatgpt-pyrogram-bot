@@ -36,7 +36,8 @@ dependencies = [
     "uvloop (==0.22.1) ; sys_platform not in 'win32 cygwin cli'",
     "winloop (==0.4.0) ; sys_platform in 'win32 cygwin cli'",
     "audioop-lts (==0.2.2) ; python_version >= \"3.13\"",
-    "lottie[video] (>=0.7.2,<0.8.0)"
+    "lottie[video] (>=0.7.2,<0.8.0)",
+    "pycairo (>=1.29.0,<2.0.0)",
 ]
 
 [tool.poetry]
