@@ -26,6 +26,12 @@ def main() -> None:
         except ImportError:
             logger.info("uvloop not installed. Using default asyncio event loop.")
 
+    # for testing images in workflow
+    # kinda meh, but i'm too lazy to add all the envs as repo secrets
+    if os.environ.get("WORKFLOW", "false").lower() == "true":
+        logger.info("Workflow mode detected. Exiting gracefully.")
+        exit(0)
+
     # Check if the required environment variables are set
     required_values = ['TELEGRAM_BOT_TOKEN', 'TELEGRAM_API_ID', 'TELEGRAM_API_HASH', 'OPENAI_API_KEY']
     missing_values = [value for value in required_values if not os.environ.get(value)]

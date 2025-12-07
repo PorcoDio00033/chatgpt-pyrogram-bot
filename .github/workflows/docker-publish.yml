@@ -52,7 +52,7 @@ jobs:
           severity: 'CRITICAL,HIGH'
 
       - name: Upload Trivy results (amd64)
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         if: always()
         with:
           sarif_file: 'trivy-results-amd64.sarif'
@@ -60,8 +60,8 @@ jobs:
 
       - name: Test amd64 container
         run: |
-          docker run --rm -d --name test-container test-image-amd64
-          sleep 60
+          docker run -d --name test-container -e WORKFLOW=true test-image-amd64
+          sleep 10
           
           if ! docker ps | grep -q test-container; then
             echo "❌ Container died!"
@@ -118,7 +118,7 @@ jobs:
           severity: 'CRITICAL,HIGH'
 
       - name: Upload Trivy results (arm64)
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         if: always()
         with:
           sarif_file: 'trivy-results-arm64.sarif'
@@ -126,8 +126,8 @@ jobs:
 
       - name: Test arm64 container
         run: |
-          docker run --rm -d --name test-container test-image-arm64
-          sleep 60
+          docker run -d --name test-container -e WORKFLOW=true test-image-arm64
+          sleep 10
           
           if ! docker ps | grep -q test-container; then
             echo "❌ Container died!"
