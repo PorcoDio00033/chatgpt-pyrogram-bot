@@ -60,7 +60,7 @@ jobs:
 
       - name: Test amd64 container
         run: |
-          docker run -d --name test-container -e WORKFLOW=true test-image-amd64
+          docker run -d --name test-container -e WORKFLOW=true -e TELEGRAM_API_ID=69 test-image-amd64
           sleep 10
           
           if ! docker ps | grep -q test-container; then
@@ -126,7 +126,7 @@ jobs:
 
       - name: Test arm64 container
         run: |
-          docker run -d --name test-container -e WORKFLOW=true test-image-arm64
+          docker run -d --name test-container -e WORKFLOW=true -e TELEGRAM_API_ID=69 test-image-arm64
           sleep 10
           
           if ! docker ps | grep -q test-container; then
