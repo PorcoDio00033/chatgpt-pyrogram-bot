@@ -60,11 +60,19 @@ jobs:
 
       - name: Test amd64 container
         run: |
-          docker run -d --name test-container -e WORKFLOW=true -e TELEGRAM_API_ID=69 test-image-amd64
-          sleep 10
+          # Run container and wait for exit
+          docker run --name test-container -e WORKFLOW=true -e TELEGRAM_API_ID=69 test-image-amd64
+          EXIT_CODE=$?
           
-          if ! docker ps | grep -q test-container; then
-            echo "❌ Container died!"
+          if [ $EXIT_CODE -ne 0 ]; then
+            echo "❌ Container failed with exit code $EXIT_CODE"
+            docker logs test-container
+            exit 1
+          fi
+          
+          # Check logs for expected output
+          if ! docker logs test-container 2>&1 | grep -q "Workflow mode detected"; then
+            echo "❌ Expected workflow mode message not found!"
             docker logs test-container
             exit 1
           fi
@@ -72,12 +80,10 @@ jobs:
           if docker logs test-container 2>&1 | grep -iE "error|exception|fatal" | grep -v "expected_error"; then
             echo "❌ Unexpected errors found in logs!"
             docker logs test-container
-            docker stop test-container
             exit 1
           fi
           
           echo "✅ amd64 tests passed"
-          docker stop test-container
 
       - name: Cleanup
         if: always()
@@ -126,11 +132,19 @@ jobs:
 
       - name: Test arm64 container
         run: |
-          docker run -d --name test-container -e WORKFLOW=true -e TELEGRAM_API_ID=69 test-image-arm64
-          sleep 10
+          # Run container and wait for exit
+          docker run --name test-container -e WORKFLOW=true -e TELEGRAM_API_ID=69 test-image-arm64
+          EXIT_CODE=$?
           
-          if ! docker ps | grep -q test-container; then
-            echo "❌ Container died!"
+          if [ $EXIT_CODE -ne 0 ]; then
+            echo "❌ Container failed with exit code $EXIT_CODE"
+            docker logs test-container
+            exit 1
+          fi
+          
+          # Check logs for expected output
+          if ! docker logs test-container 2>&1 | grep -q "Workflow mode detected"; then
+            echo "❌ Expected workflow mode message not found!"
             docker logs test-container
             exit 1
           fi
@@ -138,12 +152,10 @@ jobs:
           if docker logs test-container 2>&1 | grep -iE "error|exception|fatal" | grep -v "expected_error"; then
             echo "❌ Unexpected errors found in logs!"
             docker logs test-container
-            docker stop test-container
             exit 1
           fi
           
           echo "✅ arm64 tests passed"
-          docker stop test-container
 
       - name: Cleanup
         if: always()
