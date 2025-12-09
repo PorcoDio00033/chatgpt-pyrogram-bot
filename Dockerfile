@@ -49,7 +49,8 @@ COPY --from=builder /app/.venv ./.venv
 
 COPY . .
 
-RUN mkdir -p /app/data && chown -R appuser:appuser /app/data
+RUN mkdir -p /app/data && \
+    chown -R appuser:appuser /app/data /app/prompts
 
 USER appuser
 

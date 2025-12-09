@@ -372,7 +372,7 @@ class OpenAIHelper:
         reraise=True,
         retry=retry_if_exception_type(BaseException),
         wait=wait_exponential_jitter(),
-        stop=stop_after_attempt(5),
+        stop=stop_after_attempt(3),
     )
     async def __common_get_chat_response(
         self,
@@ -751,19 +751,11 @@ class OpenAIHelper:
         except Exception as e:
             raise Exception(f'⚠️ <i>{localized_text("error", bot_language)}.</i> ⚠️\n{str(e)}') from e
 
-    async def transcribe(self, filename, prompt: Optional[str] = None):
-        # FIXME do not use filename; use fileobj instead
+    async def transcribe(self, audio_file: io.BytesIO, prompt: Optional[str] = None):
         """
         Transcribes the audio file using the Whisper model.
         """
         try:
-            async with aiofiles.open(filename, mode='rb') as audio:
-                content = await audio.read()
-
-            # Create a file-like object from the bytes
-            audio_file = io.BytesIO(content)
-            audio_file.name = filename
-
             prompt_text = prompt if prompt else self.config['whisper_prompt']
             result = await self.client.audio.transcriptions.create(
                 model=self.config['whisper_model'], file=audio_file, prompt=prompt_text

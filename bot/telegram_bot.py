@@ -939,108 +939,92 @@ class ChatGPTTelegramBot:
 
         # TODO: add env "ALWAYS_TRANSCODE_TO_MP3" to be able to upload original files as provided by users instead of always transcoding them
         async def _execute():
-            filename_mp3 = f'{filename}.mp3'
             bot_language = self.config['bot_language']
             
-            downloaded_path = None
             try:
-                downloaded_path = await client.download_media(target_message, file_name=filename)
-            except Exception as e:
-                self.logger.exception(e)
-                sent_msg = await message.reply_text(
-                    text=(
-                        f'{localized_text("media_download_fail", bot_language)[0]}: '
-                        f'{str(e)}. {localized_text("media_download_fail", bot_language)[1]}'
-                    ),
-                    parse_mode=enums.ParseMode.HTML,
-                    reply_parameters=is_quoting_enabled(self.config, message),
-                    #message_thread_id=get_forum_thread_id(message)
-                )
-                self.save_reply(sent_msg, message)
-                return
+                # Download the media file
+                media_file = await client.download_media(target_message, in_memory=True)
+                
+                # Convert to MP3
+                mp3_file, duration = self._convert_media_to_mp3(media_file)
 
-            try:
-                audio_track = AudioSegment.from_file(downloaded_path)
-                # FIXME do not save to file
-                audio_track.export(filename_mp3, format='mp3')
+                if not mp3_file:
+                    await message.reply_text(
+                        text=f'{localized_text("transcribe_fail", bot_language)}: Could not convert media to MP3.',
+                        parse_mode=enums.ParseMode.HTML,
+                        reply_parameters=is_quoting_enabled(self.config, message),
+                    )
+                    return
+
                 self.logger.info(
                     f'New transcribe request received from user {extract_username(message.from_user)} '
                     f'(id: {message.from_user.id})'
                 )
 
-            except Exception as e:
-                self.logger.exception(e)
-                if os.path.exists(filename):
-                    os.remove(filename)
-                if downloaded_path and os.path.exists(downloaded_path):
-                    os.remove(downloaded_path)
-                return
+                user_id = message.from_user.id
+                if user_id not in self.usage:
+                    self.usage[user_id] = UsageTracker(user_id, extract_username(message.from_user))
 
-            user_id = message.from_user.id
-            if user_id not in self.usage:
-                self.usage[user_id] = UsageTracker(user_id, extract_username(message.from_user))
-
-            try:
-                transcript = await self.openai.transcribe(filename_mp3, transcribe_user_prompt)
+                transcript = await self.openai.transcribe(mp3_file, transcribe_user_prompt)
 
                 transcription_price = self.config['transcription_price']
-                self.usage[user_id].add_transcription_seconds(audio_track.duration_seconds, transcription_price)
+                self.usage[user_id].add_transcription_seconds(duration, transcription_price)
 
                 allowed_user_ids = self.config['allowed_user_ids'].split(',')
                 if str(user_id) not in allowed_user_ids and 'guests' in self.usage:
-                    self.usage['guests'].add_transcription_seconds(audio_track.duration_seconds, transcription_price)
+                    self.usage['guests'].add_transcription_seconds(duration, transcription_price)
 
-                # check if transcript starts with any of the prefixes
-                response_to_transcription = any(
-                    transcript.lower().startswith(prefix.lower()) if prefix else False
-                    for prefix in self.config['voice_reply_prompts']
-                )
+                    # check if transcript starts with any of the prefixes
+                    response_to_transcription = any(
+                        transcript.lower().startswith(prefix.lower()) if prefix else False
+                        for prefix in self.config['voice_reply_prompts']
+                    )
 
-                if self.config['voice_reply_transcript'] and not response_to_transcription:
-                    # Split into chunks of 4096 characters (Telegram's message limit)
-                    transcript_output = f'<i>{localized_text("transcript", bot_language)}:</i>\n"{transcript}"'
-                    chunks = split_into_chunks(transcript_output)
+                    if self.config['voice_reply_transcript'] and not response_to_transcription:
+                        # Split into chunks of 4096 characters (Telegram's message limit)
+                        transcript_output = f'<i>{localized_text("transcript", bot_language)}:</i>\n"{transcript}"'
+                        chunks = split_into_chunks(transcript_output)
 
-                    for index, transcript_chunk in enumerate(chunks):
-                        sent_msg = await message.reply_text(
-                            text=transcript_chunk,
-                            parse_mode=enums.ParseMode.HTML,
-                            reply_parameters=is_quoting_enabled(self.config, message) if index == 0 else None,
-                            #message_thread_id=get_forum_thread_id(message)
-                        )
-                        self.save_reply(sent_msg, message)
-                else:
-                    # when user input text after /stt command, for example if they want a more detailed transcriptions with timestamps or similar
-                    if transcribe_user_prompt:
-                        full_query = str(self.openai.config['stt_user_prompt']).format(transcript=transcript, transcribe_user_prompt=transcribe_user_prompt)
+                        for index, transcript_chunk in enumerate(chunks):
+                            sent_msg = await message.reply_text(
+                                text=transcript_chunk,
+                                parse_mode=enums.ParseMode.HTML,
+                                reply_parameters=is_quoting_enabled(self.config, message) if index == 0 else None,
+                                #message_thread_id=get_forum_thread_id(message)
+                            )
+                            self.save_reply(sent_msg, message)
                     else:
-                        full_query = transcript
+                        # when user input text after /stt command, for example if they want a more detailed transcriptions with timestamps or similar
+                        if transcribe_user_prompt:
+                            full_query = str(self.openai.config['stt_user_prompt']).format(transcript=transcript, transcribe_user_prompt=transcribe_user_prompt)
+                        else:
+                            full_query = transcript
 
-                    # Get the response of the transcript
-                    response, total_tokens = await self.openai.get_chat_response(
-                        chat_id=ai_context_id, query=full_query, user_id=str(user_id)
-                    )
-
-                    self.usage[user_id].add_chat_tokens(total_tokens, self.config['token_price'])
-                    if str(user_id) not in allowed_user_ids and 'guests' in self.usage:
-                        self.usage['guests'].add_chat_tokens(total_tokens, self.config['token_price'])
-
-                    # Split into chunks of 4096 characters (Telegram's message limit)
-                    transcript_output = (
-                        f'<i>{localized_text("transcript", bot_language)}:</i>\n"{transcript}"\n\n'
-                        f'<i>{localized_text("answer", bot_language)}:</i>\n{response}'
-                    )
-                    chunks = split_into_chunks(transcript_output)
-
-                    for index, transcript_chunk in enumerate(chunks):
-                        sent_msg = await message.reply_text(
-                            text=transcript_chunk,
-                            parse_mode=enums.ParseMode.HTML,
-                            link_preview_options=types.LinkPreviewOptions(is_disabled=True),
-                            reply_parameters=is_quoting_enabled(self.config, message) if index == 0 else None,
-                            #message_thread_id=get_forum_thread_id(message)
+                        # Get the response of the transcript
+                        response, total_tokens = await self.openai.get_chat_response(
+                            chat_id=ai_context_id, query=full_query, user_id=str(user_id)
                         )
-                        self.save_reply(sent_msg, message)
+
+                        self.usage[user_id].add_chat_tokens(total_tokens, self.config['token_price'])
+                        if str(user_id) not in allowed_user_ids and 'guests' in self.usage:
+                            self.usage['guests'].add_chat_tokens(total_tokens, self.config['token_price'])
+
+                        # Split into chunks of 4096 characters (Telegram's message limit)
+                        transcript_output = (
+                            f'<i>{localized_text("transcript", bot_language)}:</i>\n"{transcript}"\n\n'
+                            f'<i>{localized_text("answer", bot_language)}:</i>\n{response}'
+                        )
+                        chunks = split_into_chunks(transcript_output)
+
+                        for index, transcript_chunk in enumerate(chunks):
+                            sent_msg = await message.reply_text(
+                                text=transcript_chunk,
+                                parse_mode=enums.ParseMode.HTML,
+                                link_preview_options=types.LinkPreviewOptions(is_disabled=True),
+                                reply_parameters=is_quoting_enabled(self.config, message) if index == 0 else None,
+                                #message_thread_id=get_forum_thread_id(message)
+                            )
+                            self.save_reply(sent_msg, message)
 
             except Exception as e:
                 self.logger.exception(e)
@@ -1050,11 +1034,6 @@ class ChatGPTTelegramBot:
                     reply_parameters=is_quoting_enabled(self.config, message),
                     #message_thread_id=get_forum_thread_id(message)
                 )
-            finally:
-                if os.path.exists(filename_mp3):
-                    os.remove(filename_mp3)
-                if downloaded_path and os.path.exists(downloaded_path):
-                    os.remove(downloaded_path)
 
         await wrap_with_indicator(client, message, _execute, enums.ChatAction.TYPING)
 
@@ -2084,16 +2063,50 @@ class ChatGPTTelegramBot:
         if self.openai.db_pool:
             await self.openai.db_pool.close()
 
-    def _convert_tgs_to_mp4(self, tgs_data: bytes) -> Optional[bytes]:
+    def _convert_media_to_mp3(self, media_file: io.BytesIO) -> tuple[Optional[io.BytesIO], float]:
         """
-        Converts TGS (Lottie JSON) data to MP4 using lottie[video].
+        Converts a media file to MP3 format.
+        """
+        try:
+            with tempfile.NamedTemporaryFile(delete=False) as temp_input:
+                temp_input.write(media_file.read())
+                temp_input_path = temp_input.name
+
+            temp_output_path = temp_input_path + ".mp3"
+
+            try:
+                audio = AudioSegment.from_file(temp_input_path)
+                duration = audio.duration_seconds
+                audio.export(temp_output_path, format="mp3")
+
+                if os.path.exists(temp_output_path):
+                    with open(temp_output_path, 'rb') as f:
+                        mp3_data = f.read()
+                    
+                    mp3_file = io.BytesIO(mp3_data)
+                    mp3_file.name = "audio.mp3"
+                    return mp3_file, duration
+                return None, 0.0
+            finally:
+                if os.path.exists(temp_input_path):
+                    os.remove(temp_input_path)
+                if os.path.exists(temp_output_path):
+                    os.remove(temp_output_path)
+
+        except Exception as e:
+            self.logger.error(f"Error converting media to MP3: {str(e)}")
+            return None, 0.0
+
+    def _convert_tgs_to_webm(self, tgs_data: bytes) -> Optional[bytes]:
+        """
+        Converts TGS (Lottie JSON) data to WEBM using lottie[video].
         """
         try:
             with tempfile.NamedTemporaryFile(suffix='.tgs', delete=False) as temp_input:
                 temp_input.write(tgs_data)
                 temp_input_path = temp_input.name
 
-            temp_output_path = temp_input_path + ".mp4"
+            temp_output_path = temp_input_path + ".webm"
 
             try:
                 # Parse TGS
@@ -2101,7 +2114,7 @@ class ChatGPTTelegramBot:
                     anim = parse_tgs(f)
                 
                 # Export to Video
-                export_video(anim, temp_output_path, fps=30)
+                export_video(anim, temp_output_path, format="webm")
 
                 if os.path.exists(temp_output_path):
                     with open(temp_output_path, 'rb') as f:
@@ -2182,7 +2195,7 @@ class ChatGPTTelegramBot:
                 media_bytes = temp_file.read()
                 # Check if we need to convert TGS to MP4
                 if message.sticker and message.sticker.is_animated:
-                    converted_bytes = await asyncio.to_thread(self._convert_tgs_to_mp4, media_bytes)
+                    converted_bytes = await asyncio.to_thread(self._convert_tgs_to_webm, media_bytes)
                     if converted_bytes:
                         media_bytes = converted_bytes
                     else:
