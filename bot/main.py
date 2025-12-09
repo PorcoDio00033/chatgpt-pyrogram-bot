@@ -1,5 +1,6 @@
 import os
 import sys
+import asyncio
 
 from config import functions_available, model, openai_config, plugin_config, telegram_config
 from openai_helper import OpenAIHelper
@@ -25,6 +26,13 @@ def main() -> None:
             logger.info("Using uvloop event loop")
         except ImportError:
             logger.info("uvloop not installed. Using default asyncio event loop.")
+
+    # required by pyrogram else RuntimeError
+    # https://stackoverflow.com/questions/79795917
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
 
     # for testing images in workflow
     # kinda meh, but i'm too lazy to add all the envs as repo secrets
