@@ -266,7 +266,8 @@ class ChatGPTTelegramBot:
             api_id=self.config['telegram_api_id'],
             api_hash=self.config['telegram_api_hash'],
             bot_token=self.config['token'],
-            proxy=self.config['proxy']
+            proxy=self.config['proxy'],
+            workdir="data"
         )
 
     def get_thread_id(self, message: Message) -> str:
