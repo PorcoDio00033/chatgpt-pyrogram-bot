@@ -1,3 +1,5 @@
+# TODO: replace this with a proper db instance instead of json files
+
 import json
 import os.path
 import pathlib
@@ -13,7 +15,7 @@ class UsageTracker:
     """
     UsageTracker class
     Enables tracking of daily/monthly usage per user.
-    User files are stored as JSON in /usage_logs directory.
+    User files are stored as JSON in data/usage_logs directory.
     JSON example:
     {
         "user_name": "@user_name",
@@ -40,13 +42,13 @@ class UsageTracker:
     }
     """
 
-    def __init__(self, user_id, user_name, logs_dir='usage_logs'):
+    def __init__(self, user_id, user_name, logs_dir='data/usage_logs'):
         """
         Initializes UsageTracker for a user with current date.
         Loads usage data from usage log file.
         :param user_id: Telegram ID of the user
         :param user_name: Telegram user name
-        :param logs_dir: path to directory of usage logs, defaults to "usage_logs"
+        :param logs_dir: path to directory of usage logs, defaults to "data/usage_logs"
         """
         self.user_id = user_id
         self.logs_dir = logs_dir
@@ -62,7 +64,7 @@ class UsageTracker:
                 self.usage['usage_history']['tts_characters'] = {}
         else:
             # ensure directory exists
-            pathlib.Path(logs_dir).mkdir(exist_ok=True)
+            pathlib.Path(logs_dir).mkdir(parents=True, exist_ok=True)
             # create new dictionary for this user
             self.usage = {
                 'user_name': user_name,

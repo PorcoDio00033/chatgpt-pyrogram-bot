@@ -6,5 +6,5 @@ services:
     env_file:
       - .env
     volumes:
-      # Persist data (logs, etc.)
+      # Persist data (logs, sessions, usage_logs etc.)
       - ${HOST_PERSISTENT_PATH}/data:/app/data
