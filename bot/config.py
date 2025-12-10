@@ -184,6 +184,8 @@ openai_config = {
     'show_usage': os.environ.get('SHOW_USAGE', 'true').lower() == 'true',
     'stream': os.environ.get('STREAM', 'true').lower() == 'true',
     'proxy': os.environ.get('PROXY', None) or os.environ.get('OPENAI_PROXY', None),
+    'openai_base_url': os.environ.get('OPENAI_BASE_URL', None),
+    'max_openai_api_retries': int(os.environ.get('MAX_OPENAI_API_RETRIES', 3)),
     'max_history_size': int(os.environ.get('MAX_HISTORY_SIZE', 500)),
     'max_conversation_age_minutes': int(os.environ.get('MAX_CONVERSATION_AGE_MINUTES', 10080)),
     'assistant_prompt': assistant_prompt,

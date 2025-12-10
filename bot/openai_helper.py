@@ -27,7 +27,7 @@ from config import (
 )
 from openai.types.images_response import Usage
 from plugin_manager import PluginManager
-from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential_jitter
+#from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential_jitter
 
 from chill_logging import get_logger_instance
 from utils import is_direct_result
@@ -141,7 +141,7 @@ class OpenAIHelper:
         :param plugin_manager: The plugin manager
         """
         http_client = httpx.AsyncClient(proxy=config['proxy']) if 'proxy' in config else None
-        self.client = openai.AsyncOpenAI(api_key=config['api_key'], http_client=http_client)
+        self.client = openai.AsyncOpenAI(api_key=config['api_key'], base_url=config['openai_base_url'], http_client=http_client, max_retries=config['max_openai_api_retries'])
 
         self.db_pool = None
 
@@ -368,12 +368,13 @@ class OpenAIHelper:
             self.conversation_locks[chat_id] = asyncio.Lock()
         return self.conversation_locks[chat_id]
 
-    @retry(
-        reraise=True,
-        retry=retry_if_exception_type(BaseException),
-        wait=wait_exponential_jitter(),
-        stop=stop_after_attempt(3),
-    )
+    ## not needed because AsyncOpenAI already handles retries
+    # @retry(
+    #     reraise=True,
+    #     retry=retry_if_exception_type(BaseException),
+    #     wait=wait_exponential_jitter(),
+    #     stop=stop_after_attempt(3),
+    # )
     async def __common_get_chat_response(
         self,
         chat_id: str,

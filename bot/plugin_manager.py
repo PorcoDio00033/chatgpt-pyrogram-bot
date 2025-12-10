@@ -12,7 +12,7 @@ from plugins.weather import WeatherPlugin
 from plugins.website_content import WebsiteContentPlugin
 from plugins.wolfram_alpha import WolframAlphaPlugin
 from plugins.worldtimeapi import WorldTimeApiPlugin
-from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential_jitter
+#from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential_jitter
 
 if TYPE_CHECKING:
     from openai_helper import OpenAIHelper
@@ -68,12 +68,13 @@ class PluginManager:
                     del spec['function']['strict']
         return specs
 
-    @retry(
-        reraise=True,
-        retry=retry_if_exception_type(BaseException),
-        wait=wait_exponential_jitter(),
-        stop=stop_after_attempt(3),
-    )
+    ## not needed because AsyncOpenAI already handles retries
+    # @retry(
+    #     reraise=True,
+    #     retry=retry_if_exception_type(BaseException),
+    #     wait=wait_exponential_jitter(),
+    #     stop=stop_after_attempt(3),
+    # )
     async def call_function(self, chat_id: str, function_name: str, helper: 'OpenAIHelper', arguments: str) -> Dict:
         try:
             return await self.__call_function(chat_id, function_name, helper, arguments)

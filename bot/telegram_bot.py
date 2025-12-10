@@ -2068,6 +2068,7 @@ class ChatGPTTelegramBot:
         Converts a media file to MP3 format.
         """
         try:
+            media_file.seek(0)
             with tempfile.NamedTemporaryFile(delete=False) as temp_input:
                 temp_input.write(media_file.read())
                 temp_input_path = temp_input.name
@@ -2097,16 +2098,16 @@ class ChatGPTTelegramBot:
             self.logger.error(f"Error converting media to MP3: {str(e)}")
             return None, 0.0
 
-    def _convert_tgs_to_webm(self, tgs_data: bytes) -> Optional[bytes]:
+    def _convert_tgs_to_mp4(self, tgs_data: bytes) -> Optional[bytes]:
         """
-        Converts TGS (Lottie JSON) data to WEBM using lottie[video].
+        Converts TGS (Lottie JSON) data to MP4 using lottie[video].
         """
         try:
             with tempfile.NamedTemporaryFile(suffix='.tgs', delete=False) as temp_input:
                 temp_input.write(tgs_data)
                 temp_input_path = temp_input.name
 
-            temp_output_path = temp_input_path + ".webm"
+            temp_output_path = temp_input_path + ".mp4"
 
             try:
                 # Parse TGS
@@ -2114,7 +2115,7 @@ class ChatGPTTelegramBot:
                     anim = parse_tgs(f)
                 
                 # Export to Video
-                export_video(anim, temp_output_path, format="webm")
+                export_video(anim, temp_output_path, format="mp4")
 
                 if os.path.exists(temp_output_path):
                     with open(temp_output_path, 'rb') as f:
@@ -2195,7 +2196,7 @@ class ChatGPTTelegramBot:
                 media_bytes = temp_file.read()
                 # Check if we need to convert TGS to MP4
                 if message.sticker and message.sticker.is_animated:
-                    converted_bytes = await asyncio.to_thread(self._convert_tgs_to_webm, media_bytes)
+                    converted_bytes = await asyncio.to_thread(self._convert_tgs_to_mp4, media_bytes)
                     if converted_bytes:
                         media_bytes = converted_bytes
                     else:
