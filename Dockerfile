@@ -41,6 +41,7 @@ RUN apt-get update && apt-get install -y \
     curl \
     gnupg \
     libcairo2 \
+    libpng16-16t64=1.6.48-1+deb13u1 \
     && rm -rf /var/lib/apt/lists/*
 
 RUN useradd -m -u 1000 -U appuser
