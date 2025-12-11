@@ -1,6 +1,7 @@
 import datetime
 import os
 import urllib.parse
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -152,17 +153,18 @@ def read_prompt_from_file(file_path_env_var, default_path, fallback_env_var, def
         return os.environ[fallback_env_var]
 
     # Priority 2: File
-    file_path = os.environ.get(file_path_env_var, default_path)
-    if file_path and os.path.isfile(file_path):
-        try:
-            with open(file_path, 'r', encoding='utf-8') as file:
-                content = file.read().strip()
+    file_path_str = os.environ.get(file_path_env_var, default_path)
+    if file_path_str:
+        file_path = Path(file_path_str)
+        if file_path.is_file():
+            try:
+                content = file_path.read_text(encoding='utf-8').strip()
                 if content:
                     logger.info(f'Read prompt from file: {file_path}')
                     return content
-        except Exception as e:
-            logger.warning(f'Failed to read prompt from file {file_path}: {e}')
-
+            except Exception as e:
+                logger.warning(f'Failed to read prompt from file {file_path}: {e}')
+    
     # Priority 3: Default value
     return default_value
 

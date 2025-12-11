@@ -2132,35 +2132,42 @@ class ChatGPTTelegramBot:
             self.logger.error(f"Error converting TGS to MP4: {str(e)}")
             return None
 
-    async def _handle_multimodal_input(self, client: Client, message: Message, media_type: str = None) -> bool:
+    async def _handle_multimodal_input(self, client: Client, message: Message, media_type: str = None, reply: Message = None) -> bool:
         """
         Unified handler for multimodal input (audio, video, pdf, stickers, animations).
         Returns True if handled (or rejected due to budget), False if not supported.
         """
+        if reply is None:
+            prompt = message.caption or message.text
+        else:
+            prompt = message_text(message)
+
+        target_msg = reply if reply else message
+
         media = (
-            message.audio
-            or message.voice
-            or message.video
-            or message.video_note
-            or message.document
-            or message.sticker
-            or message.animation
+            target_msg.audio
+            or target_msg.voice
+            or target_msg.video
+            or target_msg.video_note
+            or target_msg.document
+            or target_msg.sticker
+            or target_msg.animation
         )
         if not media:
             return False
 
         # Determine media type if not provided
         if not media_type:
-            if message.audio or message.voice:
+            if target_msg.audio or target_msg.voice:
                 media_type = 'audio'
-            elif message.video or message.video_note or message.animation:
+            elif target_msg.video or target_msg.video_note or target_msg.animation:
                 media_type = 'video'
-            elif message.sticker:
-                if message.sticker.is_animated or message.sticker.is_video:
+            elif target_msg.sticker:
+                if target_msg.sticker.is_animated or target_msg.sticker.is_video:
                     media_type = 'video'
                 else:
                     media_type = 'image'
-            elif message.document:
+            elif target_msg.document:
                 mime = (media.mime_type or '').lower()
                 if mime == 'application/pdf':
                     media_type = 'pdf'
@@ -2184,6 +2191,33 @@ class ChatGPTTelegramBot:
         if not await self.check_allowed_and_within_budget(client, message):
             return True  # Handled (rejected)
 
+        if is_group_chat(message):
+            ignore_key = 'ignore_group_transcriptions' if media_type == 'audio' else 'ignore_group_vision'
+            if self.config.get(ignore_key, False):
+                self.logger.info(f'Multimodal {media_type} coming from group chat, ignoring...')
+                return True
+
+            trigger_keyword = self.config['group_trigger_keyword']
+
+            if reply is None:
+                no_reply = (
+                    message.reply_to_message is None
+                    or message.reply_to_message.from_user.id != client.me.id
+                )
+                no_keyword = (prompt is None and trigger_keyword != '') or (
+                    prompt is not None and not prompt.lower().startswith(trigger_keyword.lower())
+                )
+                if no_reply and no_keyword:
+                    self.logger.info(f'Multimodal {media_type} coming from group chat with wrong keyword, ignoring...')
+                    return True
+            else:
+                no_keyword = (prompt is None and trigger_keyword != '') or (
+                    prompt is not None and not prompt.lower().startswith(trigger_keyword.lower())
+                )
+                if no_keyword:
+                    self.logger.info(f'Multimodal {media_type} coming from group chat with wrong keyword, ignoring...')
+                    return True
+
         self.logger.info(
             f'New {media_type} request received from user {extract_username(message.from_user)} (id: {message.from_user.id})'
         )
@@ -2194,28 +2228,19 @@ class ChatGPTTelegramBot:
                 temp_file = await client.download_media(media, in_memory=True)
                 temp_file.seek(0)
                 media_bytes = temp_file.read()
-                # Check if we need to convert TGS to MP4
-                if message.sticker and message.sticker.is_animated:
-                    converted_bytes = await asyncio.to_thread(self._convert_tgs_to_mp4, media_bytes)
-                    if converted_bytes:
-                        media_bytes = converted_bytes
-                    else:
-                        self.logger.warning("TGS conversion failed, sending original data.")
-
-                media_base64 = base64.b64encode(media_bytes).decode('utf-8')
 
                 # Use actual mime type from Telegram object
                 mime_type = getattr(media, 'mime_type', '')
 
                 # Fallback for voice/video_note/sticker/animation if mime_type is missing
                 if not mime_type:
-                    if message.voice:
+                    if target_msg.voice:
                         mime_type = 'audio/ogg'
-                    elif message.video_note:
+                    elif target_msg.video_note:
                         mime_type = 'video/mp4'
-                    elif message.sticker:
+                    elif target_msg.sticker:
                         mime_type = 'image/webp'
-                    elif message.animation:
+                    elif target_msg.animation:
                         mime_type = 'video/mp4'
 
                 # Fallback format if still empty
@@ -2229,9 +2254,21 @@ class ChatGPTTelegramBot:
                     elif media_type == 'image':
                         mime_type = 'image/webp'
 
+                # Check if we need to convert TGS to MP4
+                if target_msg.sticker and target_msg.sticker.is_animated:
+                    converted_bytes = await asyncio.to_thread(self._convert_tgs_to_mp4, media_bytes)
+                    if converted_bytes:
+                        media_bytes = converted_bytes
+                        mime_type = 'video/mp4'
+                    else:
+                        self.logger.warning("TGS conversion failed.")
+                        return False
+
+                media_base64 = base64.b64encode(media_bytes).decode('utf-8')
+
                 kwargs = {
                     'chat_id': self.get_thread_id(message),
-                    'query': message.caption or message.text or "",
+                    'query': prompt,
                     'user_id': str(message.from_user.id),
                 }
 

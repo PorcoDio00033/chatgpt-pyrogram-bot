@@ -379,7 +379,7 @@ class OpenAIHelper:
         self,
         chat_id: str,
         query: str,
-        stream=False,
+        stream: bool = False,
         image: Optional[str] = None,
         audio: Optional[dict] = None,
         video: Optional[dict] = None,
