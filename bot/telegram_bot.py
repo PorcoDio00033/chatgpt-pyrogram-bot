@@ -1507,7 +1507,7 @@ class ChatGPTTelegramBot:
                 or reply.sticker
                 or reply.animation
             ):
-                return await self.handle_media(client, message, reply)
+                return await self._handle_media_no_lock(client, message, reply)
 
         if is_group_chat(message):
             trigger_keyword = self.config['group_trigger_keyword']
@@ -2311,11 +2311,14 @@ class ChatGPTTelegramBot:
 
     @with_conversation_lock
     async def handle_media(self, client: Client, message: Message, reply: Message = None):
+        await self._handle_media_no_lock(client, message, reply)
+
+    async def _handle_media_no_lock(self, client: Client, message: Message, reply: Message = None):
         """
         Unified handler for media messages (audio, video, document).
         """
         # Try to handle as multimodal input first
-        if await self._handle_multimodal_input(client, message, reply):
+        if await self._handle_multimodal_input(client, message, reply=reply):
             return
 
         target_msg = reply if reply else message
@@ -2325,8 +2328,8 @@ class ChatGPTTelegramBot:
             await self._handle_pdf_legacy(client, message, reply)
             return
 
-        # Handle image documents via vision
-        if target_msg.document and (target_msg.document.mime_type or '').startswith('image/'):
+        # Handle images via vision
+        if target_msg.photo or (target_msg.document and (target_msg.document.mime_type or '').startswith('image/')):
             await self._vision_no_lock(client, message, reply)
 
     async def _handle_pdf_legacy(self, client: Client, message: Message, reply: Message = None):
