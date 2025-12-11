@@ -1495,14 +1495,19 @@ class ChatGPTTelegramBot:
         prompt = message_text(message)
         self.last_message[chat_id] = prompt
 
-        if message.reply_to_message and (message.reply_to_message.document or message.reply_to_message.photo):
-            attachment = message.reply_to_message.document or message.reply_to_message.photo
-            if isinstance(attachment, types.Document) and attachment.mime_type == 'application/pdf':
-                message.reply_to_message.caption = prompt
-                return await self.handle_pdf(client, message.reply_to_message)
-
-            if message.reply_to_message.photo or message.reply_to_message.document:
-                 return await self._vision_no_lock(client, message, message.reply_to_message)
+        if message.reply_to_message:
+            reply = message.reply_to_message
+            if (
+                reply.photo
+                or reply.document
+                or reply.audio
+                or reply.voice
+                or reply.video
+                or reply.video_note
+                or reply.sticker
+                or reply.animation
+            ):
+                return await self.handle_media(client, message, reply)
 
         if is_group_chat(message):
             trigger_keyword = self.config['group_trigger_keyword']
@@ -2305,24 +2310,26 @@ class ChatGPTTelegramBot:
         return True
 
     @with_conversation_lock
-    async def handle_media(self, client: Client, message: Message):
+    async def handle_media(self, client: Client, message: Message, reply: Message = None):
         """
         Unified handler for media messages (audio, video, document).
         """
         # Try to handle as multimodal input first
-        if await self._handle_multimodal_input(client, message):
+        if await self._handle_multimodal_input(client, message, reply):
             return
 
+        target_msg = reply if reply else message
+
         # Fallback logic for PDF: Manual Text Extraction
-        if message.document and message.document.mime_type == 'application/pdf':
-            await self._handle_pdf_legacy(client, message)
+        if target_msg.document and target_msg.document.mime_type == 'application/pdf':
+            await self._handle_pdf_legacy(client, message, reply)
             return
 
         # Handle image documents via vision
-        if message.document and (message.document.mime_type or '').startswith('image/'):
-            await self._vision_no_lock(client, message)
+        if target_msg.document and (target_msg.document.mime_type or '').startswith('image/'):
+            await self._vision_no_lock(client, message, reply)
 
-    async def _handle_pdf_legacy(self, client: Client, message: Message):
+    async def _handle_pdf_legacy(self, client: Client, message: Message, reply: Message = None):
         """
         Extract text from PDF files and process as prompt.
         Legacy method for when PDF is not supported as multimodal input.
@@ -2330,7 +2337,7 @@ class ChatGPTTelegramBot:
         if not await self.check_allowed_and_within_budget(client, message):
             return
 
-        caption = message.caption or ''
+        caption = message_text(message) or ''
         if is_group_chat(message):
             trigger_keyword = self.config['group_trigger_keyword']
 
@@ -2344,10 +2351,12 @@ class ChatGPTTelegramBot:
 
         self.logger.info(f'New PDF received from user {extract_username(message.from_user)} (id: {message.from_user.id})')
 
+        target_msg = reply if reply else message
+
         async def _process_pdf():
             try:
                 # Pyrogram download_media
-                temp_path = await client.download_media(message.document)
+                temp_path = await client.download_media(target_msg.document)
 
                 extracted_text = ''
                 try:
@@ -2390,6 +2399,8 @@ class ChatGPTTelegramBot:
 
                 # Modify message text to be the prompt
                 message.text = prompt
+                # Prevent loop if called from _prompt_no_lock
+                message.reply_to_message = None
 
                 await self._prompt_no_lock(client, message)
 
