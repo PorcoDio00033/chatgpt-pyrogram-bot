@@ -974,57 +974,57 @@ class ChatGPTTelegramBot:
                 if str(user_id) not in allowed_user_ids and 'guests' in self.usage:
                     self.usage['guests'].add_transcription_seconds(duration, transcription_price)
 
-                    # check if transcript starts with any of the prefixes
-                    response_to_transcription = any(
-                        transcript.lower().startswith(prefix.lower()) if prefix else False
-                        for prefix in self.config['voice_reply_prompts']
+                # check if transcript starts with any of the prefixes
+                response_to_transcription = any(
+                    transcript.lower().startswith(prefix.lower()) if prefix else False
+                    for prefix in self.config['voice_reply_prompts']
+                )
+
+                if self.config['voice_reply_transcript'] and not response_to_transcription:
+                    # Split into chunks of 4096 characters (Telegram's message limit)
+                    transcript_output = f'<i>{localized_text("transcript", bot_language)}:</i>\n"{transcript}"'
+                    chunks = split_into_chunks(transcript_output)
+
+                    for index, transcript_chunk in enumerate(chunks):
+                        sent_msg = await message.reply_text(
+                            text=transcript_chunk,
+                            parse_mode=enums.ParseMode.HTML,
+                            reply_parameters=is_quoting_enabled(self.config, message) if index == 0 else None,
+                            #message_thread_id=get_forum_thread_id(message)
+                        )
+                        self.save_reply(sent_msg, message)
+                else:
+                    # when user input text after /stt command, for example if they want a more detailed transcriptions with timestamps or similar
+                    if transcribe_user_prompt:
+                        full_query = str(self.openai.config['stt_user_prompt']).format(transcript=transcript, transcribe_user_prompt=transcribe_user_prompt)
+                    else:
+                        full_query = transcript
+
+                    # Get the response of the transcript
+                    response, total_tokens = await self.openai.get_chat_response(
+                        chat_id=ai_context_id, query=full_query, user_id=str(user_id)
                     )
 
-                    if self.config['voice_reply_transcript'] and not response_to_transcription:
-                        # Split into chunks of 4096 characters (Telegram's message limit)
-                        transcript_output = f'<i>{localized_text("transcript", bot_language)}:</i>\n"{transcript}"'
-                        chunks = split_into_chunks(transcript_output)
+                    self.usage[user_id].add_chat_tokens(total_tokens, self.config['token_price'])
+                    if str(user_id) not in allowed_user_ids and 'guests' in self.usage:
+                        self.usage['guests'].add_chat_tokens(total_tokens, self.config['token_price'])
 
-                        for index, transcript_chunk in enumerate(chunks):
-                            sent_msg = await message.reply_text(
-                                text=transcript_chunk,
-                                parse_mode=enums.ParseMode.HTML,
-                                reply_parameters=is_quoting_enabled(self.config, message) if index == 0 else None,
-                                #message_thread_id=get_forum_thread_id(message)
-                            )
-                            self.save_reply(sent_msg, message)
-                    else:
-                        # when user input text after /stt command, for example if they want a more detailed transcriptions with timestamps or similar
-                        if transcribe_user_prompt:
-                            full_query = str(self.openai.config['stt_user_prompt']).format(transcript=transcript, transcribe_user_prompt=transcribe_user_prompt)
-                        else:
-                            full_query = transcript
+                    # Split into chunks of 4096 characters (Telegram's message limit)
+                    transcript_output = (
+                        f'<i>{localized_text("transcript", bot_language)}:</i>\n"{transcript}"\n\n'
+                        f'<i>{localized_text("answer", bot_language)}:</i>\n{response}'
+                    )
+                    chunks = split_into_chunks(transcript_output)
 
-                        # Get the response of the transcript
-                        response, total_tokens = await self.openai.get_chat_response(
-                            chat_id=ai_context_id, query=full_query, user_id=str(user_id)
+                    for index, transcript_chunk in enumerate(chunks):
+                        sent_msg = await message.reply_text(
+                            text=transcript_chunk,
+                            parse_mode=enums.ParseMode.HTML,
+                            link_preview_options=types.LinkPreviewOptions(is_disabled=True),
+                            reply_parameters=is_quoting_enabled(self.config, message) if index == 0 else None,
+                            #message_thread_id=get_forum_thread_id(message)
                         )
-
-                        self.usage[user_id].add_chat_tokens(total_tokens, self.config['token_price'])
-                        if str(user_id) not in allowed_user_ids and 'guests' in self.usage:
-                            self.usage['guests'].add_chat_tokens(total_tokens, self.config['token_price'])
-
-                        # Split into chunks of 4096 characters (Telegram's message limit)
-                        transcript_output = (
-                            f'<i>{localized_text("transcript", bot_language)}:</i>\n"{transcript}"\n\n'
-                            f'<i>{localized_text("answer", bot_language)}:</i>\n{response}'
-                        )
-                        chunks = split_into_chunks(transcript_output)
-
-                        for index, transcript_chunk in enumerate(chunks):
-                            sent_msg = await message.reply_text(
-                                text=transcript_chunk,
-                                parse_mode=enums.ParseMode.HTML,
-                                link_preview_options=types.LinkPreviewOptions(is_disabled=True),
-                                reply_parameters=is_quoting_enabled(self.config, message) if index == 0 else None,
-                                #message_thread_id=get_forum_thread_id(message)
-                            )
-                            self.save_reply(sent_msg, message)
+                        self.save_reply(sent_msg, message)
 
             except Exception as e:
                 self.logger.exception(e)
